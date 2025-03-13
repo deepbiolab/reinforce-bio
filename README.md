@@ -142,7 +142,7 @@ The optimization process will display progress and eventually show the optimal c
 ## Citation
 
 If you find this project useful in your research, please cite it as follows:
-```
+```bibtex
 @software{reinforce_bio2025,
   author       = {Tim-Lin},
   title        = {Reinforce-Bio: Leveraging Reinforcement Learning and Hybrid Modeling for Bioprocess Optimization},
