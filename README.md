@@ -3,7 +3,7 @@
 
 ![model-arch](./assets/reinforce-bio.svg)
 
-Reinforce-Bio is a research project focused on leveraging advanced reinforcement learning to optimize bioprocess parameters and improve efficiency in biological systems. 
+Reinforce-Bio is a research project focused on leveraging reinforcement learning to optimize bioprocess parameters and improve efficiency in biological systems. 
 
 ## Overview
 
@@ -11,7 +11,7 @@ Bioprocess optimization is a critical area in biotechnology, aiming to enhance t
 
 ![](./assets/optimization_progress.gif)
 
-Currently, this repository contains models and methods for hybrid modeling and simulation of bioprocesses, with an emphasis on integrating data-driven approaches like Gaussian Process (GP) modeling. In future, the project aims to develop a reinforcement learning optimization model that can identify the optimal process conditions for maximizing product yield and minimizing costs.
+Currently, this repository contains models and methods for hybrid modeling and simulation of bioprocesses, with an emphasis on integrating data-driven approaches like Gaussian Process (GP) modeling. The project implements a reinforcement learning optimization model that can identify the optimal process conditions for maximizing product yield and minimizing costs.
 
 ### Key Features
 
@@ -38,14 +38,39 @@ The hybrid model integrates both mechanistic and machine learning components to 
    - Feed End Day
    - Initial conditions (e.g., initial glucose and cell density)
 
-
 ## Optimization: Deep Deterministic Policy Gradient (DDPG)
 
-The optimization module leverages the hybrid model to identify optimal process conditions. By simulating a range of parameter combinations, the framework evaluates their impact on product yield and other performance metrics, ultimately selecting the best conditions.
+The optimization module leverages the DDPG algorithm to identify optimal process conditions. By simulating a range of parameter combinations, the framework evaluates their impact on product yield and other performance metrics, ultimately selecting the best conditions.
 
-## Future Work
+### Optimization Results
 
-The next phase of this project will focus on integrating reinforcement learning (RL) to design adaptive feeding strategies that dynamically adjust to bioprocess conditions. This will further enhance the flexibility and robustness of bioprocess optimization.
+After running the optimization process, the system will display the optimal process conditions found, including:
+
+- Initial process parameters (feed start/end days, initial glucose and cell density)
+- Daily feeding rates for the entire process duration
+- Final product titer achieved
+- Episode number where the best result was found
+
+Example output:
+```
+Current optimal process conditions:
+feed_start: 1.8562
+feed_end: 8.3028
+Glc_0: 44.0554
+VCD_0: 0.5488
+
+Daily feeding rates (mg/L):
+Day 1: 11.1716
+Day 2: 12.2233
+Day 3: 10.3142
+...
+Day 15: 8.1669
+
+Predicted final titer: 1518.27 mg/L
+Found in episode: 216
+```
+
+This output provides a comprehensive view of the optimized process conditions and their predicted performance.
 
 ## Getting Started
 
@@ -64,9 +89,55 @@ The next phase of this project will focus on integrating reinforcement learning 
    pip install -r requirements.txt
    ```
 
+### Running Hybrid Model
+
+0. Ensure your environment is properly configured in `src/config.py`
+
+1. **Training Mode**:
+   ```bash
+   python run_hybrid_model.py --mode train
+   ```
+   This will:
+   - Train new GP models using the training dataset
+   - Save the trained models to `checkpoints/hybrid_model.pkl`
+   - Evaluate performance on both training and test sets
+   - Display metrics (RMSE and R² scores) for each state variable
+   - Generate visualization plots for selected runs
+
+2. **Testing Mode**:
+   ```bash
+   python run_hybrid_model.py --mode test
+   ```
+   This will:
+   - Load previously trained models from `checkpoints/hybrid_model.pkl`
+   - Evaluate performance on the test dataset
+   - Display test metrics for each state variable
+   - Generate comparison plots between predicted and actual values
+
+3. **Prediction Mode**:
+   ```bash
+   python run_hybrid_model.py --mode predict
+   ```
+   This will:
+   - Load trained models
+   - Make sure data is available in the `dataset/interpolation/predict` directory
+   - Generate predictions for new process conditions
+   - Save predictions to the results directory
+   - Create visualization plots of the predicted profiles
+
+### Running Optimization
+
+To run the optimization process:
+
+0. Ensure your environment is properly configured in `src/config.py`
+1. Run the main script:
+   ```bash
+   python run_optimization.py
+   ```
+
+The optimization process will display progress and eventually show the optimal conditions found, as demonstrated in the example above.
 
 > For more details, refer to the documentation in the `report/` folder or the notebooks in the `notebook/` folder.
-
 
 ## Citation
 

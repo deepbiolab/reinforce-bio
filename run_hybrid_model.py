@@ -1,3 +1,16 @@
+"""
+Hybrid Model Training and Prediction Script for Bioreactor System
+
+This script implements a hybrid modeling approach for bioreactor systems, combining
+Gaussian Process (GP) models with mechanistic knowledge. It supports three operation modes:
+training, testing, and prediction.
+
+Author: Tim Lin
+Organization: DeepBioLab
+License: MIT License
+"""
+
+
 import os
 import argparse
 import numpy as np
