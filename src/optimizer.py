@@ -11,7 +11,7 @@ from tqdm import tqdm
 from collections import deque
 from typing import Optional, Tuple, Dict, List
 
-from src.environment import BioreactorEnv
+from src.environment import BioreactorEnv, StateIndex
 from src.agent import Agent
 
 
@@ -125,7 +125,7 @@ def run_episode(env: BioreactorEnv, agent: Agent, max_t: int) -> Dict:
         next_state, reward, done, _, _ = env.step(action)
         loss = agent.step(state, action, reward, next_state, done)
         
-        states.append(state[:4])  # Only store VCD, Glucose, Lactate, Titer
+        states.append(state)
         actions.append(action)
         
         total_reward += reward
@@ -145,7 +145,7 @@ def run_episode(env: BioreactorEnv, agent: Agent, max_t: int) -> Dict:
         'total_reward': total_reward,
         'critic_loss': total_critic_loss,
         'actor_loss': total_actor_loss,
-        'final_titer': state[3]
+        'final_titer': state[StateIndex.TITER]
     }
 
 class OptimizationResult:
@@ -156,6 +156,7 @@ class OptimizationResult:
         self.episode = 0
         self.predictions = None
         self.time_points = None
+        self.daily_feeds = None
         
     def update(self, 
                episode: int, 
@@ -167,15 +168,20 @@ class OptimizationResult:
         if final_titer > self.final_titer:
             self.final_titer = final_titer
             self.episode = episode
+
+            feed_range = env.param_ranges["Glc_feed_rate"]
+            actual_feeds = [(a[0] + 1) * (feed_range[1] - feed_range[0]) / 2 + feed_range[0] 
+                            for a in actions]
             self.params = {
                 'feed_start': env.current_params['feed_start'],
                 'feed_end': env.current_params['feed_end'],
-                'Glc_feed_rate': np.mean([a[0] for a in actions]),
                 'Glc_0': env.current_params['Glc_0'],
-                'VCD_0': env.current_params['VCD_0']
+                'VCD_0': env.current_params['VCD_0'],
+                'daily_feeds': actual_feeds,
             }
-            self.predictions = np.array(states)
             self.time_points = np.arange(env.config.TOTAL_DAYS)
+            self.predictions = np.array(states)
+            self.daily_feeds = actual_feeds
             return True
         return False
     
@@ -186,13 +192,19 @@ class OptimizationResult:
             'final_titer': self.final_titer,
             'episode': self.episode,
             'predictions': self.predictions,
-            'time_points': self.time_points
+            'time_points': self.time_points,
+            'daily_feeds': self.daily_feeds
         }
 
     def format_print(self):
         """Print formatted optimization results."""
         print("Current optimal process conditions:")
-        for param, value in self.params.items():
-            print(f"{param}: {value:.4f}")
-        print(f"Predicted final titer: {self.final_titer:.2f} mg/L")
+        print(f"feed_start: {self.params['feed_start']:.4f}")
+        print(f"feed_end: {self.params['feed_end']:.4f}")
+        print(f"Glc_0: {self.params['Glc_0']:.4f}")
+        print(f"VCD_0: {self.params['VCD_0']:.4f}")
+        print("\nDaily feeding rates (mg/L):")
+        for day, feed in enumerate(self.daily_feeds):
+            print(f"Day {day+1}: {feed:.4f}")
+        print(f"\nPredicted final titer: {self.final_titer:.2f} mg/L")
         print(f"Found in episode: {self.episode}")

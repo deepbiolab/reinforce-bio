@@ -57,10 +57,10 @@ def get_default_config() -> Dict[str, Any]:
                 "INIT_VOLUME_ML": 1000.0,
                 "TIME_STEP_HOURS": 24,
                 "TOTAL_DAYS": 15,
-                "MAX_VCD": 100.0,
-                "MAX_GLUCOSE": 100.0,
-                "MAX_LACTATE": 100.0,
-                "MAX_TITER": 1000.0,
+                "MAX_VCD": 50.0,
+                "MAX_GLUCOSE": 80.0,
+                "MAX_LACTATE": 5.4,
+                "MAX_TITER": 5000.0,
             },
             # Parameter ranges
             "param_ranges": {
@@ -88,9 +88,11 @@ def get_default_config() -> Dict[str, Any]:
         
         # DDPG training parameters
         "ddpg_params": {
-            "n_episodes": 15, # 300
+            "n_episodes": 1000,
             "window": 5,
             "max_t": 30,
+            "early_stop_patience": 50,
+            "min_improvement": 0.01,
             "checkpoint_dir": "checkpoints",  # Directory for saving agent weights
             "best_model_name": "best_agent.pth",  # Filename for best model
             "final_model_name": "final_agent.pth",  # Filename for final model
@@ -98,6 +100,6 @@ def get_default_config() -> Dict[str, Any]:
         
         # Plotting parameters
         "plot_params": {
-            "rolling_window": 100,
+            "rolling_window": 5,
         }
     }

@@ -34,11 +34,11 @@ class ProcessConfig:
     TIME_STEP_HOURS: int = 24
     TOTAL_DAYS: int = 15
 
-    # State variable ranges
-    MAX_VCD: float = 100.0
-    MAX_GLUCOSE: float = 100.0
-    MAX_LACTATE: float = 100.0
-    MAX_TITER: float = 1000.0
+    # State variable ranges (with units)
+    MAX_VCD: float = 50.0      # 10^6 cells/mL
+    MAX_GLUCOSE: float = 80.0  # g/L
+    MAX_LACTATE: float = 5.4   # g/L
+    MAX_TITER: float = 5000.0  # mg/L
 
 
 class StateIndex(IntEnum):
@@ -48,7 +48,6 @@ class StateIndex(IntEnum):
     GLUCOSE = 1
     LACTATE = 2
     TITER = 3
-    TIME = 4  # Additional state for time step
 
 
 class ParamConfig:
@@ -90,65 +89,18 @@ class BioreactorEnv(gym.Env):
         super().__init__()
 
         # Create environment configurations from config
-        process_config = ProcessConfig(**process)
-        process_constraints = ProcessConstraints(**constraints)
+        self.config = ProcessConfig(**process)
+        self.constraints = ProcessConstraints(**constraints)
+        self.param_ranges = param_ranges or ParamConfig.get_default_ranges()
 
         self.models = models
         self.sign_mask = sign_mask
-        self.param_ranges = param_ranges or ParamConfig.get_default_ranges()
-        self.config = process_config or ProcessConfig()
-        self.constraints = process_constraints or ProcessConstraints()
 
         # Initialize spaces
         self._setup_spaces()
 
         # Initialize state arrays
         self._initialize_state_arrays()
-
-    def _setup_spaces(self):
-        """Setup action and observation spaces."""
-        # Action space: Glucose feed rate for each day
-        self.action_space = spaces.Box(
-            low=np.float32(self.param_ranges["Glc_feed_rate"][0]),
-            high=np.float32(self.param_ranges["Glc_feed_rate"][1]),
-            shape=(1,),
-            dtype=np.float32,
-        )
-
-        # Observation space: [VCD, Glucose, Lactate, Titer, Time]
-        self.observation_space = spaces.Box(
-            low=np.array([0, 0, 0, 0, 0], dtype=np.float32),
-            high=np.array(
-                [
-                    self.config.MAX_VCD,
-                    self.config.MAX_GLUCOSE,
-                    self.config.MAX_LACTATE,
-                    self.config.MAX_TITER,
-                    self.config.TOTAL_DAYS,
-                ],
-                dtype=np.float32
-            ),
-            dtype=np.float32,
-        )
-
-    def _initialize_state_arrays(self):
-        """Initialize arrays for storing process data."""
-        self.state_dim = len(StateIndex) - 1  # Exclude time from state arrays
-
-        self.X = np.zeros((1, self.config.TOTAL_DAYS, self.state_dim))  # States
-        self.F = np.zeros((1, self.config.TOTAL_DAYS, self.state_dim))  # Feeding rates
-        self.V = np.zeros((1, self.config.TOTAL_DAYS, 1))  # Volume
-        self.Z = np.zeros(
-            (1, self.config.TOTAL_DAYS, len(self.param_ranges))
-        )  # Parameters
-
-    def _sample_initial_params(self) -> Dict[str, float]:
-        """Sample initial parameters from their ranges."""
-        return {
-            param: np.random.uniform(low, high)
-            for param, (low, high) in self.param_ranges.items()
-            if param != "Glc_feed_rate"  # Exclude feed rate as it's the action
-        }
 
     def reset(self) -> np.ndarray:
         """Reset the environment to initial state."""
@@ -168,10 +120,6 @@ class BioreactorEnv(gym.Env):
         obs = self._get_observation()
 
         return obs, {}
-
-    def _get_observation(self) -> np.ndarray:
-        """Create observation vector from current state."""
-        return np.append(self.current_state, self.current_step)
 
     def step(
         self, action: np.ndarray
@@ -197,11 +145,60 @@ class BioreactorEnv(gym.Env):
         obs = self._get_observation()
 
         return obs, reward, done, False, {}
+    
+    def _setup_spaces(self):
+        """Setup action and observation spaces."""
+        # Action space: Glucose feed rate for each day
+        self.action_space = spaces.Box(
+            low=np.float32(self.param_ranges["Glc_feed_rate"][0]),
+            high=np.float32(self.param_ranges["Glc_feed_rate"][1]),
+            shape=(1,),
+            dtype=np.float32,
+        )
+
+        # Observation space: [VCD, Glucose, Lactate, Titer]
+        self.observation_space = spaces.Box(
+            low=np.array([0, 0, 0, 0], dtype=np.float32),
+            high=np.array(
+                [
+                    self.config.MAX_VCD,
+                    self.config.MAX_GLUCOSE,
+                    self.config.MAX_LACTATE,
+                    self.config.MAX_TITER,
+                ],
+                dtype=np.float32
+            ),
+            dtype=np.float32,
+        )
+    
+    def _get_observation(self) -> np.ndarray:
+        """Create observation vector from current state."""
+        return self.current_state
+    
+    def _initialize_state_arrays(self):
+        """Initialize arrays for storing process data."""
+        self.state_dim = len(StateIndex)
+
+        self.X = np.zeros((1, self.config.TOTAL_DAYS, self.state_dim))  # States
+        self.F = np.zeros((1, self.config.TOTAL_DAYS, self.state_dim))  # Feeding rates
+        self.Z = np.zeros((1, self.config.TOTAL_DAYS, len(self.param_ranges)))  # Parameters
+        self.V = np.zeros((1, self.config.TOTAL_DAYS, 1))  # Volume
+
+    def _sample_initial_params(self) -> Dict[str, float]:
+        """Sample initial parameters from their ranges."""
+        return {
+            param: np.random.uniform(low, high)
+            for param, (low, high) in self.param_ranges.items()
+            if param != "Glc_feed_rate"  # Exclude feed rate as it's the action
+        }
 
     def _update_process_conditions(self, action: np.ndarray):
         """Update process conditions based on action."""
-        # Set feed rate
-        hourly_rate = action[0] / self.config.TIME_STEP_HOURS
+        # Set feed rate: from [-1, 1](see agent.py, select_action method) into real range
+        feed_range = self.param_ranges["Glc_feed_rate"]
+        actual_feed = (action[0] + 1) * (feed_range[1] - feed_range[0]) / 2 + feed_range[0]
+        
+        hourly_rate = actual_feed / self.config.TIME_STEP_HOURS
         self.F[0, self.current_step, StateIndex.GLUCOSE] = hourly_rate
 
         # Update volume

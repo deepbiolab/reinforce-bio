@@ -140,6 +140,34 @@ class Agent:
 
         # OU Noise process
         self.noise = OUNoise(self.action_size, seed)
+        
+        self.state_maxs = np.array([
+            env.config.MAX_VCD,
+            env.config.MAX_GLUCOSE,
+            env.config.MAX_LACTATE,
+            env.config.MAX_TITER,
+        ])
+    
+    def normalize_state(self, state):
+        """Normalize state values to [-1, 1] range.
+        
+        Args:
+            state: numpy array or torch tensor of state values
+            
+        Returns:
+            Normalized state values in same format as input
+        """
+        if isinstance(state, np.ndarray):
+            normalized = 2 * (state / self.state_maxs) - 1
+            return normalized
+        elif isinstance(state, torch.Tensor):
+            if state.device != self.device:
+                state = state.to(self.device)
+            state_maxs = torch.FloatTensor(self.state_maxs).to(self.device)
+            normalized = 2 * (state / state_maxs) - 1
+            return normalized
+        else:
+            raise TypeError(f"Unsupported state type: {type(state)}")
 
     def __repr__(self):
         return (
@@ -168,7 +196,9 @@ class Agent:
             state (array_like): current state
             eps (float): epsilon, for epsilon-greedy action selection
         """
-        state = torch.from_numpy(state).float().to(self.device)
+        normalized_state = self.normalize_state(state)
+        state = torch.from_numpy(normalized_state).float().to(self.device)
+        
         self.actor.eval()
         with torch.no_grad():
             action = self.actor(state).cpu().data.numpy()
@@ -199,6 +229,14 @@ class Agent:
         """
         # get experiences
         states, actions, rewards, next_states, dones = experiences
+
+        # Normalize states before learning
+        norm_states = self.normalize_state(states)
+        norm_next_states = self.normalize_state(next_states)
+        
+        # Clip normalized states to ensure they're in valid range
+        norm_states = torch.clamp(norm_states, -1, 1)
+        norm_next_states = torch.clamp(norm_next_states, -1, 1)
 
         # ---------------------- update critic ----------------------#
         # compute target values using target network
