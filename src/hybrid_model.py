@@ -1,3 +1,10 @@
+"""Hybrid model implementation combining mechanistic and ML approaches.
+
+Author: Tim Lin
+Organization: DeepBioLab
+License: MIT License
+"""
+
 import numpy as np
 from tqdm import tqdm
 from scipy.integrate import odeint

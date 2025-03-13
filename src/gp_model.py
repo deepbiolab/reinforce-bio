@@ -1,4 +1,4 @@
-"""Main script for training and evaluating hybrid model.
+"""Gaussian Process model implementation for hybrid modeling.
 
 Author: Tim Lin
 Organization: DeepBioLab

@@ -1,3 +1,10 @@
+"""Neural network model architectures for DDPG implementation.
+
+Author: Tim Lin
+Organization: DeepBioLab
+License: MIT License
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

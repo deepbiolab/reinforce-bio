@@ -1,3 +1,10 @@
+"""Experience replay buffer implementation for DDPG agent.
+
+Author: Tim Lin
+Organization: DeepBioLab
+License: MIT License
+"""
+
 import random
 import numpy as np
 from collections import namedtuple, deque

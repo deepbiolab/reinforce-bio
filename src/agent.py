@@ -1,6 +1,14 @@
+"""DDPG agent implementation for bioreactor optimization.
+
+Author: Tim Lin
+Organization: DeepBioLab 
+License: MIT License
+"""
+
 import copy
 import random
 import numpy as np
+from typing import Tuple, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -8,13 +16,39 @@ import torch.optim as optim
 
 from .nn_models import Actor, Critic
 from .replay_buffer import ReplayBuffer
+from .environment import BioreactorEnv
 
 
 class OUNoise:
-    """Ornstein-Uhlenbeck process."""
+    """Ornstein-Uhlenbeck noise process for action space exploration.
+    
+    Generates temporally correlated noise following the Ornstein-Uhlenbeck process,
+    which is particularly suitable for control tasks with continuous action spaces.
+    
+    Attributes:
+        mu (np.ndarray): Mean of the noise process
+        theta (float): Rate of mean reversion
+        sigma (float): Scale of the noise
+        state (np.ndarray): Current state of the noise process
+    """
 
-    def __init__(self, size, seed, mu=0.0, theta=0.15, sigma=0.2):
-        """Initialize parameters and noise process."""
+    def __init__(
+        self, 
+        size: int, 
+        seed: int, 
+        mu: float = 0.0, 
+        theta: float = 0.15, 
+        sigma: float = 0.2
+    ):
+        """Initialize parameters and noise process.
+        
+        Args:
+            size: Dimension of the noise vector
+            seed: Random seed for reproducibility
+            mu: Mean of the noise process
+            theta: Rate of mean reversion (how quickly noise returns to mean)
+            sigma: Scale/volatility of the noise
+        """
         self.mu = mu * np.ones(size)
         self.theta = theta
         self.sigma = sigma
@@ -36,34 +70,46 @@ class OUNoise:
 
 
 class Agent:
-    """Interacts with and learns from the environment."""
+    """DDPG Agent that interacts with and learns from the bioreactor environment.
+    
+    The agent uses an actor-critic architecture with experience replay and 
+    soft target network updates to learn optimal control policies.
+    
+    Attributes:
+        actor (Actor): Policy network that maps states to actions
+        critic (Critic): Value network that estimates Q-values
+        memory (ReplayBuffer): Buffer storing experience tuples for training
+        noise (OUNoise): Ornstein-Uhlenbeck noise process for exploration
+    """
 
     def __init__(
         self,
-        env,
-        test_mode=False,
-        hidden_size=(400, 300),
-        buffer_size=int(1e6),
-        batch_size=64,
-        gamma=0.99,
-        tau=1e-3,
-        lr_actor=1e-4,
-        lr_critic=1e-3,
-        seed=42,
-        device=None,
+        env: BioreactorEnv,
+        test_mode: bool = False,
+        hidden_size: Tuple[int, int] = (400, 300),
+        buffer_size: int = int(1e6),
+        batch_size: int = 64,
+        gamma: float = 0.99,
+        tau: float = 1e-3,
+        lr_actor: float = 1e-4,
+        lr_critic: float = 1e-3,
+        seed: int = 42,
+        device: Optional[Union[str, torch.device]] = None,
     ):
         """Initialize an Agent object.
 
-        Params
-        ======
-            buffer_size (int): replay buffer size
-            batch_size (int): minibatch size
-            lr (float): learning rate
-            gamma (float): discount factor
-            tau (float): soft update of target parameters
-            update_step (int): how often to update the network
-            seed (int): random seed
-
+        Args:
+            env: Bioreactor environment the agent interacts with
+            test_mode: Whether to run in evaluation mode without exploration
+            hidden_size: Sizes of hidden layers for actor and critic networks
+            buffer_size: Maximum size of experience replay buffer
+            batch_size: Size of each training batch
+            gamma: Discount factor for future rewards
+            tau: Soft update coefficient for target networks
+            lr_actor: Learning rate for actor network
+            lr_critic: Learning rate for critic network
+            seed: Random seed for reproducibility
+            device: Device to run neural networks on ('cpu', 'cuda', 'mps', etc.)
         """
         self.device = torch.device(device)
         self.seed = random.seed(seed)
@@ -80,31 +126,20 @@ class Agent:
         self.action_size = env.action_space.shape[0]
 
         # Actor Network (w/ Target Network)
-        self.actor = Actor(self.state_size, self.action_size, hidden_size, seed).to(
-            device
-        )
-        self.actor_target = Actor(
-            self.state_size, self.action_size, hidden_size, seed
-        ).to(device)
+        self.actor = Actor(self.state_size, self.action_size, hidden_size, seed).to(device)
+        self.actor_target = Actor(self.state_size, self.action_size, hidden_size, seed).to(device)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=self.lr_actor)
 
         # Critic Network (w/ Target Network)
-        self.critic = Critic(self.state_size, self.action_size, hidden_size, seed).to(
-            device
-        )
-        self.critic_target = Critic(
-            self.state_size, self.action_size, hidden_size, seed
-        ).to(device)
+        self.critic = Critic(self.state_size, self.action_size, hidden_size, seed).to(device)
+        self.critic_target = Critic(self.state_size, self.action_size, hidden_size, seed).to(device)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.lr_critic)
 
         # Replay memory
-        self.memory = ReplayBuffer(
-            self.action_size, self.buffer_size, self.batch_size, seed, device=device
-        )
+        self.memory = ReplayBuffer(self.action_size, self.buffer_size, self.batch_size, seed, device=device)
 
         # OU Noise process
         self.noise = OUNoise(self.action_size, seed)
-        
 
     def __repr__(self):
         return (

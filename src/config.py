@@ -1,3 +1,10 @@
+"""Configuration parameters for bioreactor optimization system.
+
+Author: Tim Lin
+Organization: DeepBioLab
+License: MIT License
+"""
+
 from typing import Dict, Any
 
 def get_default_config() -> Dict[str, Any]:
@@ -81,9 +88,9 @@ def get_default_config() -> Dict[str, Any]:
         
         # DDPG training parameters
         "ddpg_params": {
-            "n_episodes": 10, # 300
-            "window": 100,
-            "max_t": 300,
+            "n_episodes": 15, # 300
+            "window": 5,
+            "max_t": 30,
             "checkpoint_dir": "checkpoints",  # Directory for saving agent weights
             "best_model_name": "best_agent.pth",  # Filename for best model
             "final_model_name": "final_agent.pth",  # Filename for final model
