@@ -1,1893 +1,63 @@
 #!/usr/bin/env python3
 """
-nano_biopfm.py — Single-file Neural ODE for CHO bioprocess modeling.
+eda_report.py — Exploratory Data Analysis report for BioPFM datasets.
 
-Inspired by Karpathy's nanoGPT: everything in one readable file.
-Implements training, evaluation, stepwise prediction, and fine-tuning
-for multi-task Neural ODE with clone embeddings.
+Generates publication-ready EDA visualizations in Datahow hybrid-modeling style.
+No torch dependency — pure data analysis with numpy, pandas, sklearn, matplotlib, seaborn.
 
 Usage:
-    uv run python scripts/nano_biopfm.py --data nano_sample.csv --holdout-clone Clone_077
+    uv run python scripts/eda_report.py --data datasets/nano_legacy.csv --output eda_results/
+    uv run python scripts/eda_report.py --data /path/to/real_data.csv --output real_eda/ --n-clusters 4
 """
 
-# ============================================================
-# S0: Imports & Configuration
-# ============================================================
-
 import argparse
-import copy
 import logging
 import os
-from collections import namedtuple
+import sys
 
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
+import seaborn as sns
+from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from torchdiffeq import odeint
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 logger = logging.getLogger(__name__)
 
-# --------------- Global configuration dict ---------------
+# ============================================================
+# Column constants (matching nano_legacy.csv / real data)
+# ============================================================
 
-CFG = {
-    # --- Data columns ---
-    "time_col": "time",
-    "exp_id_col": "exp_id",
-    "product_id_col": "clone_name",
-    "state_cols": ["vcd", "glc", "lac", "amm", "titer", "osmo", "viability", "pco2", "po2"],
-    "control_cols": ["temperature", "pH", "do"],
-    "feed_cols": ["feed_glc", "feed_7a", "feed_7b"],
-    "volume_col": "working_vol",
-    # sample_vol not used — volume tracking from working_vol diffs only
-    "static_cols": ["agitation"],
+TIME_COL = "time"
+EXP_ID_COL = "exp_id"
+CLONE_COL = "clone_name"
 
-    # --- ODE semantics ---
-    "biomass_col": "vcd",
-    "state_signs": {"vcd": 1, "glc": -1, "lac": 1, "amm": 1,
-                    "titer": 1, "osmo": 1, "viability": 1, "pco2": 1, "po2": -1},
-    "empirical_states": ["viability"],
-    "zero_init_states": ["titer"],
-    "feed_to_state": {"glc": [("feed_glc", 0.4), ("feed_7a", 0.08)]},
+STATE_COLS = ["vcd", "glc", "lac", "amm", "titer", "osmo", "viability", "pco2", "po2"]
+CONTROL_COLS = ["temperature", "pH", "do"]
+FEED_COLS = ["feed_glc", "feed_7a", "feed_7b"]
+VOLUME_COL = "working_vol"
 
-    # --- Model architecture ---
-    "clone_emb_dim": 4,
-    "hidden_dim": 64,
+REQUIRED_COLS = [TIME_COL, EXP_ID_COL, CLONE_COL]
 
-    # --- Training ---
-    "n_ensemble": 5,
-    "warmup_epochs": 15,
-    "epochs": 200,
-    "lr": 2e-3,
-    "batch_size": 16,
-    "patience": 50,
-    "grad_clip": 1.0,
-    "val_ratio": 0.15,
-    "seed": 42,
-
-    # --- ODE solver ---
-    "ode_method": "rk4",
-    "ode_rtol": 1e-5,
-    "ode_atol": 1e-7,
-
-    # --- Stepwise ---
-    "step_size_hours": 24.0,
-    "reset_tolerance": 6.0,
-
-    # --- Finetune ---
-    "finetune_epochs": 100,
-    "finetune_lr": 3e-4,
-    "finetune_patience": 50,
-
-    # --- Visualization ---
-    "figsize_single": (10, 6),
-    "figsize_grid": (14, 10),
-    "dpi": 150,
+# Pretty labels for plots
+STATE_LABELS = {
+    "vcd": "VCD (10⁶ cells/mL)", "glc": "Glucose (mM)", "lac": "Lactate (mM)",
+    "amm": "Ammonium (mM)", "titer": "Titer (mg/L)", "osmo": "Osmolality (mOsm/kg)",
+    "viability": "Viability (%)", "pco2": "pCO₂ (mmHg)", "po2": "pO₂ (mmHg)",
+}
+FEED_LABELS = {
+    "feed_glc": "Glucose Feed (L)", "feed_7a": "Feed 7a (L)", "feed_7b": "Feed 7b (L)",
 }
 
-# --------------- Named tuples for clean data flow ---------------
-
-ExperimentData = namedtuple("ExperimentData", [
-    "times", "states", "obs_masks", "controls", "feed_rates",
-    "vol_rates", "initial_vol", "initial_states", "clone_name", "clone_idx", "statics",
-])
-
-BatchData = namedtuple("BatchData", [
-    "times", "initial_states", "states", "obs_masks", "pad_masks",
-    "controls", "feed_rates", "vol_rates", "initial_vols",
-    "clone_indices", "statics",
-])
-
-
-def get_device(preference="auto"):
-    """Auto-detect best available device (cuda > mps > cpu)."""
-    if preference != "auto":
-        return torch.device(preference)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
 
 # ============================================================
-# S1: Data Loading & Preprocessing
+# Style & utilities
 # ============================================================
 
-def load_and_preprocess(csv_path, cfg):
-    """
-    Load a CSV dataset and convert to per-experiment ExperimentData dicts.
-
-    Returns:
-        data: dict {exp_id: ExperimentData}
-        vocab: dict with clone_to_idx, idx_to_clone, n_clones, clone_names
-    """
-    df = pd.read_csv(csv_path)
-
-    # --- Validate required columns ---
-    required = (
-        [cfg["time_col"], cfg["exp_id_col"], cfg["product_id_col"], cfg["volume_col"]]
-        + cfg["state_cols"] + cfg["control_cols"] + cfg["feed_cols"] + cfg["static_cols"]
-    )
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in CSV: {missing}")
-
-    # --- Build clone vocabulary (sorted for reproducibility) ---
-    clone_names = sorted(df[cfg["product_id_col"]].unique().tolist())
-    clone_to_idx = {name: idx for idx, name in enumerate(clone_names)}
-    vocab = {
-        "clone_to_idx": clone_to_idx,
-        "idx_to_clone": {idx: name for name, idx in clone_to_idx.items()},
-        "n_clones": len(clone_names),
-        "clone_names": clone_names,
-    }
-
-    state_cols = cfg["state_cols"]
-    control_cols = cfg["control_cols"]
-    feed_cols = cfg["feed_cols"]
-    static_cols = cfg["static_cols"]
-    zero_init = set(cfg["zero_init_states"])
-
-    data = {}
-    for exp_id, grp in df.groupby(cfg["exp_id_col"]):
-        grp = grp.sort_values(cfg["time_col"]).reset_index(drop=True)
-        n_steps = len(grp)
-
-        # Time in hours
-        times = grp[cfg["time_col"]].values.astype(np.float32)
-
-        # States and observation masks
-        raw_states = grp[state_cols].values  # (T, n_states)
-        obs_masks = (~np.isnan(raw_states)).astype(np.float32)
-        states = np.nan_to_num(raw_states, nan=0.0).astype(np.float32)
-
-        # Initial states: y0
-        initial_states = np.zeros(len(state_cols), dtype=np.float32)
-        for j, col in enumerate(state_cols):
-            if col in zero_init:
-                # If first measurement is NaN, start at 0; otherwise use it
-                first_val = raw_states[0, j]
-                initial_states[j] = 0.0 if np.isnan(first_val) else first_val
-            else:
-                # First non-NaN value (fall back to 0)
-                valid = raw_states[:, j]
-                non_nan = valid[~np.isnan(valid)]
-                initial_states[j] = non_nan[0] if len(non_nan) > 0 else 0.0
-
-        # Controls (forward fill NaN, then back fill remaining)
-        ctrl_df = grp[control_cols].ffill().bfill()
-        controls = ctrl_df.values.astype(np.float32)
-
-        # Time deltas for rate computation
-        dt = np.diff(times)  # (T-1,)
-        if len(dt) == 0:
-            dt = np.array([1.0], dtype=np.float32)
-        dt_extended = np.append(dt, dt[-1])  # (T,) — last point reuses previous dt
-        dt_extended = np.maximum(dt_extended, 1e-6)  # avoid division by zero
-
-        # Feed rates: amount / dt → rate (amount per hour)
-        feed_amounts = grp[feed_cols].fillna(0.0).values.astype(np.float32)  # (T, n_feeds)
-        feed_rates = feed_amounts / dt_extended[:, None]
-
-        # Volume rates: max(V[i+1]-V[i], 0) / dt
-        vol = grp[cfg["volume_col"]].values.astype(np.float32)
-        vol_diff = np.diff(vol)  # (T-1,)
-        vol_diff = np.append(vol_diff, vol_diff[-1] if len(vol_diff) > 0 else 0.0)
-        vol_rates = np.maximum(vol_diff, 0.0) / dt_extended
-        vol_rates = vol_rates.astype(np.float32)
-
-        initial_vol = vol[0]
-
-        # Clone info
-        clone_name = grp[cfg["product_id_col"]].iloc[0]
-        clone_idx = clone_to_idx[clone_name]
-
-        # Static features (from first row)
-        statics = grp[static_cols].iloc[0].values.astype(np.float32)
-
-        data[exp_id] = ExperimentData(
-            times=times,
-            states=states,
-            obs_masks=obs_masks,
-            controls=controls,
-            feed_rates=feed_rates,
-            vol_rates=vol_rates,
-            initial_vol=np.float32(initial_vol),
-            initial_states=initial_states,
-            clone_name=clone_name,
-            clone_idx=clone_idx,
-            statics=statics,
-        )
-
-    logger.info("Loaded %d experiments from %s", len(data), csv_path)
-    return data, vocab
-
-
-def split_holdout(data, holdout_clone, cfg):
-    """Split data into base (training pool) and holdout (held-out clone)."""
-    base_data = {}
-    holdout_data = {}
-    for exp_id, exp in data.items():
-        if exp.clone_name == holdout_clone:
-            holdout_data[exp_id] = exp
-        else:
-            base_data[exp_id] = exp
-    logger.info(
-        "Split: %d base experiments, %d holdout experiments (clone=%s)",
-        len(base_data), len(holdout_data), holdout_clone,
-    )
-    if len(holdout_data) == 0:
-        raise ValueError(f"Holdout clone '{holdout_clone}' not found in data")
-    return base_data, holdout_data
-
-
-def split_train_val(base_data, val_ratio, seed):
-    """
-    Product-stratified train/val split. Ensures at least 1 val per clone
-    when possible.
-
-    Returns:
-        (train_ids, val_ids) — lists of experiment IDs.
-    """
-    rng = np.random.RandomState(seed)
-
-    # Group experiment IDs by clone
-    clone_groups = {}
-    for exp_id, exp in base_data.items():
-        clone_groups.setdefault(exp.clone_name, []).append(exp_id)
-
-    train_ids, val_ids = [], []
-    for clone_name, ids in sorted(clone_groups.items()):
-        ids = sorted(ids)  # reproducibility
-        rng.shuffle(ids)
-        n_val = max(1, int(len(ids) * val_ratio))
-        if len(ids) <= 1:
-            # Only one experiment: put in train (cannot split further)
-            train_ids.extend(ids)
-        else:
-            val_ids.extend(ids[:n_val])
-            train_ids.extend(ids[n_val:])
-
-    logger.info("Train/val split: %d train, %d val", len(train_ids), len(val_ids))
-    return train_ids, val_ids
-
-
-def compute_stats(data, train_ids, cfg):
-    """
-    Compute normalization statistics (mean/std) from training data only.
-
-    Returns dict of torch tensors: state_mean, state_std, control_mean,
-    control_std, static_mean, static_std.
-    """
-    state_cols = cfg["state_cols"]
-    control_cols = cfg["control_cols"]
-    static_cols = cfg["static_cols"]
-
-    # Gather arrays from training experiments
-    all_controls = []
-    all_statics = []
-    # Collect observed-only state values per variable (avoid NaN-filled zeros)
-    n_states = len(cfg["state_cols"])
-    obs_per_var = [[] for _ in range(n_states)]
-    for eid in train_ids:
-        exp = data[eid]
-        for j in range(n_states):
-            mask_j = exp.obs_masks[:, j] > 0.5
-            if mask_j.any():
-                obs_per_var[j].append(exp.states[mask_j, j])
-        all_controls.append(exp.controls)
-        all_statics.append(exp.statics)
-
-    # State stats from observed values only
-    s_mean_list, s_std_list = [], []
-    for j in range(n_states):
-        if obs_per_var[j]:
-            vals = np.concatenate(obs_per_var[j])
-            s_mean_list.append(vals.mean())
-            s_std_list.append(max(vals.std(), 1e-6))
-        else:
-            s_mean_list.append(0.0)
-            s_std_list.append(1.0)
-    s_mean = torch.tensor(s_mean_list, dtype=torch.float32)
-    s_std = torch.tensor(s_std_list, dtype=torch.float32)
-
-    controls_cat = np.concatenate(all_controls, axis=0)   # (N, n_ctrl)
-    statics_cat = np.stack(all_statics, axis=0)           # (M, n_static)
-
-    def _mean_std(arr):
-        m = arr.mean(axis=0).astype(np.float32)
-        s = arr.std(axis=0).astype(np.float32)
-        s = np.maximum(s, 1e-6)  # floor to avoid division by zero
-        return torch.from_numpy(m), torch.from_numpy(s)
-    c_mean, c_std = _mean_std(controls_cat)
-    st_mean, st_std = _mean_std(statics_cat)
-
-    stats = {
-        "state_mean": s_mean,
-        "state_std": s_std,
-        "control_mean": c_mean,
-        "control_std": c_std,
-        "static_mean": st_mean,
-        "static_std": st_std,
-    }
-    logger.info("Computed normalization stats from %d training experiments", len(train_ids))
-    return stats
-
-
-def make_batch(exp_ids, data, device):
-    """
-    Collate a list of experiments into a padded BatchData on the given device.
-
-    Padding strategy:
-      - times/states/obs_masks/feed_rates/vol_rates: zero-padded
-      - controls: replicate last value for padded positions
-      - pad_masks: 1 for real timesteps, 0 for padding
-    """
-    experiments = [data[eid] for eid in exp_ids]
-    max_len = max(len(exp.times) for exp in experiments)
-    n_states = experiments[0].states.shape[1]
-    n_ctrl = experiments[0].controls.shape[1]
-    n_feeds = experiments[0].feed_rates.shape[1]
-    n_static = len(experiments[0].statics)
-    batch_size = len(experiments)
-
-    # Pre-allocate numpy arrays
-    times = np.zeros((batch_size, max_len), dtype=np.float32)
-    states = np.zeros((batch_size, max_len, n_states), dtype=np.float32)
-    obs_masks = np.zeros((batch_size, max_len, n_states), dtype=np.float32)
-    pad_masks = np.zeros((batch_size, max_len), dtype=np.float32)
-    controls = np.zeros((batch_size, max_len, n_ctrl), dtype=np.float32)
-    feed_rates = np.zeros((batch_size, max_len, n_feeds), dtype=np.float32)
-    vol_rates = np.zeros((batch_size, max_len), dtype=np.float32)
-    initial_states = np.zeros((batch_size, n_states), dtype=np.float32)
-    initial_vols = np.zeros(batch_size, dtype=np.float32)
-    clone_indices = np.zeros(batch_size, dtype=np.int64)
-    statics = np.zeros((batch_size, n_static), dtype=np.float32)
-
-    for i, exp in enumerate(experiments):
-        t = len(exp.times)
-        times[i, :t] = exp.times
-        states[i, :t] = exp.states
-        obs_masks[i, :t] = exp.obs_masks
-        pad_masks[i, :t] = 1.0
-        controls[i, :t] = exp.controls
-        feed_rates[i, :t] = exp.feed_rates
-        vol_rates[i, :t] = exp.vol_rates
-        initial_states[i] = exp.initial_states
-        initial_vols[i] = exp.initial_vol
-        clone_indices[i] = exp.clone_idx
-        statics[i] = exp.statics
-
-        # Pad controls by replicating last value
-        if t < max_len:
-            controls[i, t:] = exp.controls[-1]
-
-    return BatchData(
-        times=torch.from_numpy(times).to(device),
-        initial_states=torch.from_numpy(initial_states).to(device),
-        states=torch.from_numpy(states).to(device),
-        obs_masks=torch.from_numpy(obs_masks).to(device),
-        pad_masks=torch.from_numpy(pad_masks).to(device),
-        controls=torch.from_numpy(controls).to(device),
-        feed_rates=torch.from_numpy(feed_rates).to(device),
-        vol_rates=torch.from_numpy(vol_rates).to(device),
-        initial_vols=torch.from_numpy(initial_vols).to(device),
-        clone_indices=torch.from_numpy(clone_indices).to(device),
-        statics=torch.from_numpy(statics).to(device),
-    )
-
-
-# ============================================================
-# S2: Model Architecture
-# ============================================================
-
-def make_interp_fn(times, values, method="linear"):
-    """
-    Build a closure that interpolates batched time-series data at arbitrary t.
-
-    Args:
-        times:  [B, T] monotonically increasing time grids.
-        values: [B, T, C] corresponding values.
-        method: "linear" for linear interpolation, "previous" for zero-order hold.
-
-    Returns:
-        fn(t) -> [B, C] where t is a scalar tensor (from ODE solver).
-    """
-    # Pre-extract shapes; ensure contiguous layout for searchsorted performance
-    B, T, C = values.shape
-    times = times.contiguous()
-    values = values.contiguous()
-
-    def fn(t):
-        # t is a scalar tensor from odeint; expand to [B]
-        t_expanded = t.expand(B)  # [B]
-
-        # Clamp t to valid range per batch element
-        t_min = times[:, 0]      # [B]
-        t_max = times[:, -1]     # [B]
-        t_clamped = torch.clamp(t_expanded, min=t_min, max=t_max)
-
-        # Vectorized binary search: find right boundary index for each batch
-        # searchsorted returns index where t would be inserted to keep sorted order
-        idx_right = torch.searchsorted(times, t_clamped.unsqueeze(-1))  # [B, 1]
-        idx_right = idx_right.squeeze(-1)  # [B]
-
-        # Clamp indices to valid range [1, T-1] so idx_left = idx_right - 1 >= 0
-        idx_right = torch.clamp(idx_right, min=1, max=T - 1)
-        idx_left = idx_right - 1
-
-        # Gather time boundaries: t_low, t_high per batch element
-        t_low = times[torch.arange(B, device=times.device), idx_left]    # [B]
-        t_high = times[torch.arange(B, device=times.device), idx_right]  # [B]
-
-        # Gather value boundaries: [B, C]
-        batch_idx = torch.arange(B, device=values.device)
-        v_low = values[batch_idx, idx_left]    # [B, C]
-        v_high = values[batch_idx, idx_right]  # [B, C]
-
-        if method == "previous":
-            return v_low
-
-        # Linear interpolation: alpha = (t - t_low) / (t_high - t_low)
-        dt = t_high - t_low                              # [B]
-        dt_safe = torch.clamp(dt, min=1e-8)
-        alpha = ((t_clamped - t_low) / dt_safe).unsqueeze(-1)  # [B, 1]
-        return v_low + alpha * (v_high - v_low)           # [B, C]
-
-    return fn
-
-
-def make_volume_fn(times, vol_rates, initial_vols):
-    """
-    Build a closure that computes volume at arbitrary time t via pre-computed
-    cumulative volume profile.
-
-    Args:
-        times:        [B, T] time grids.
-        vol_rates:    [B, T] volumetric addition rates (L/h).
-        initial_vols: [B] starting volumes.
-
-    Returns:
-        fn(t) -> [B] volume at time t.
-    """
-    B, T = times.shape
-
-    # Compute dt between consecutive timepoints: [B, T]
-    dt = torch.zeros_like(times)
-    dt[:, 1:] = times[:, 1:] - times[:, :-1]
-
-    # Cumulative added volume at each timepoint: [B, T]
-    incremental = vol_rates * dt                       # [B, T]
-    cum_vol = torch.cumsum(incremental, dim=1)         # [B, T]
-    total_vol = initial_vols.unsqueeze(-1) + cum_vol   # [B, T]
-
-    # Reuse make_interp_fn for 1-channel interpolation
-    interp = make_interp_fn(times, total_vol.unsqueeze(-1), method="linear")
-
-    def fn(t):
-        return interp(t).squeeze(-1)  # [B]
-
-    return fn
-
-
-def make_vol_rate_fn(times, vol_rates):
-    """
-    Build a closure that interpolates volumetric addition rate at arbitrary t.
-
-    Args:
-        times:     [B, T] time grids.
-        vol_rates: [B, T] volumetric addition rates (L/h).
-
-    Returns:
-        fn(t) -> [B] vol_rate at time t (zero-order hold).
-    """
-    # Use previous-value (ZOH) interpolation — rate is piecewise constant
-    interp = make_interp_fn(
-        times, vol_rates.unsqueeze(-1), method="previous",
-    )
-
-    def fn(t):
-        return interp(t).squeeze(-1)  # [B]
-
-    return fn
-
-
-class KineticsNet(nn.Module):
-    """
-    MLP that predicts per-state kinetic rates from normalized process state,
-    controls, statics, and a learned clone embedding.
-
-    Architecture:
-        [n_states + n_controls + n_statics + emb_dim] → 64 → Tanh → 64 → Tanh → n_states
-
-    The last layer is initialized with very small weights so that initial
-    predicted rates are near zero, stabilizing ODE integration at startup.
-    """
-
-    def __init__(self, n_states, n_controls, n_statics, n_clones,
-                 emb_dim=8, hidden_dim=64):
-        super().__init__()
-        self.clone_emb = nn.Embedding(n_clones, emb_dim)
-        input_dim = n_states + n_controls + n_statics + emb_dim
-
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, n_states),
-        )
-
-        # --- Weight initialization ---
-        # Embedding: small normal for smooth initial embeddings
-        nn.init.normal_(self.clone_emb.weight, mean=0.0, std=0.1)
-
-        # Hidden layers: Xavier uniform for stable gradient flow with Tanh
-        for layer in [self.net[0], self.net[2]]:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-        # Output layer: near-zero to start with tiny rates → stable ODE
-        output_layer = self.net[4]
-        if isinstance(output_layer, nn.Linear):
-            nn.init.normal_(output_layer.weight, mean=0.0, std=1e-4)
-            nn.init.zeros_(output_layer.bias)
-
-    def forward(self, x_continuous, clone_idx):
-        """
-        Args:
-            x_continuous: [B, n_states + n_controls + n_statics] (pre-normalized).
-            clone_idx:    [B] LongTensor of clone indices.
-
-        Returns:
-            rates: [B, n_states] predicted kinetic rates.
-        """
-        emb = self.clone_emb(clone_idx)                  # [B, emb_dim]
-        return self.net(torch.cat([x_continuous, emb], dim=-1))
-
-
-class HybridODE(nn.Module):
-    """
-    Neural ODE right-hand side: dX/dt = NN_rates × biomass + feeds − dilution.
-
-    Composes a KineticsNet with process interpolation closures to compute
-    the state derivative at any time t during ODE integration.
-
-    Equation per state i:
-        If empirical:   dX_i/dt = rate_i  (direct NN output)
-        If biomass:     dX_i/dt = rate_i × VCD
-        Otherwise:      dX_i/dt = sign_i × rate_i × VCD
-                                + Σ(feed_j × factor_j / V)
-                                − X_i × (vol_rate / V)  [dilution, ODE states only]
-    """
-    state_mean: torch.Tensor
-    state_std: torch.Tensor
-    control_mean: torch.Tensor
-    control_std: torch.Tensor
-    static_mean: torch.Tensor
-    static_std: torch.Tensor
-    state_signs: torch.Tensor
-    dilution_mask: torch.Tensor
-
-    def __init__(self, net, ctrl_fn, feed_fn, vol_fn, vol_rate_fn,
-                 stats, clone_idx, statics, cfg):
-        super().__init__()
-        self.net = net
-        self.ctrl_fn = ctrl_fn            # closure(t) -> [B, n_controls]
-        self.feed_fn = feed_fn            # closure(t) -> [B, n_feeds]
-        self.vol_fn = vol_fn              # closure(t) -> [B]
-        self.vol_rate_fn = vol_rate_fn    # closure(t) -> [B]
-        self.clone_idx = clone_idx        # [B] LongTensor
-        self.statics = statics            # [B, n_statics]
-        self.cfg = cfg
-
-        # Register normalization stats as buffers (move with .to(device))
-        self.register_buffer("state_mean", stats["state_mean"])
-        self.register_buffer("state_std", stats["state_std"])
-        self.register_buffer("control_mean", stats["control_mean"])
-        self.register_buffer("control_std", stats["control_std"])
-        self.register_buffer("static_mean", stats["static_mean"])
-        self.register_buffer("static_std", stats["static_std"])
-
-        current_device = stats["state_mean"].device
-
-        # State sign tensor: +1 for produced, -1 for consumed
-        state_cols = cfg["state_cols"]
-        signs = torch.tensor(
-            [cfg["state_signs"][c] for c in state_cols], 
-            dtype=torch.float32,
-            device=current_device
-        )
-        self.register_buffer("state_signs", signs)
-
-        # Dilution mask: 1.0 for ODE states subject to dilution, 0.0 for empirical
-        empirical_set = set(cfg["empirical_states"])
-        dilution_mask = torch.tensor(
-            [0.0 if c in empirical_set else 1.0 for c in state_cols],
-            dtype=torch.float32,
-            device=current_device
-        )
-        self.register_buffer("dilution_mask", dilution_mask)
-
-        # Feed contribution mapping: state_idx → [(feed_idx, concentration_factor)]
-        feed_cols = cfg["feed_cols"]
-        self.feed_contribs = {}
-        for state_name, entries in cfg["feed_to_state"].items():
-            si = state_cols.index(state_name)
-            self.feed_contribs[si] = [
-                (feed_cols.index(fc), factor) for fc, factor in entries
-            ]
-
-        # Cache frequently used indices
-        self.biomass_idx = state_cols.index(cfg["biomass_col"])
-        self.empirical_indices = frozenset(
-            state_cols.index(c) for c in cfg["empirical_states"]
-        )
-
-    def forward(self, t, y):
-        """
-        ODE right-hand side called by torchdiffeq.odeint.
-
-        Args:
-            t: scalar tensor — current integration time.
-            y: [B, n_states] current state vector.
-
-        Returns:
-            dxdt: [B, n_states] state derivatives.
-        """
-        B, n_states = y.shape
-
-        # 1. Interpolate process inputs at time t
-        controls = self.ctrl_fn(t)      # [B, n_controls]
-        feeds = self.feed_fn(t)         # [B, n_feeds]
-        volume = self.vol_fn(t)         # [B]
-        vol_rate = self.vol_rate_fn(t)  # [B]
-
-        # 2. Normalize inputs for the NN
-        norm_y = (y - self.state_mean) / self.state_std
-        norm_ctrl = (controls - self.control_mean) / self.control_std
-        norm_static = (self.statics - self.static_mean) / self.static_std
-
-        # 3. Predict kinetic rates
-        x_continuous = torch.cat([norm_y, norm_ctrl, norm_static], dim=-1)
-        rates = self.net(x_continuous, self.clone_idx)  # [B, n_states]
-
-        # 4. Assemble dX/dt: rate × biomass (with sign conventions)
-        vcd = torch.relu(y[:, self.biomass_idx])  # [B], non-negative viable cell density
-        dxdt = torch.zeros_like(y)
-
-        for i in range(n_states):
-            if i in self.empirical_indices:
-                # Empirical states: NN directly predicts the derivative
-                dxdt[:, i] = rates[:, i]
-            elif i == self.biomass_idx:
-                # Biomass: rate × current biomass (logistic-like growth)
-                dxdt[:, i] = rates[:, i] * vcd
-            else:
-                # Metabolites: sign × rate × biomass
-                dxdt[:, i] = self.state_signs[i] * rates[:, i] * vcd
-
-        # 5. Feed contributions: feed_rate × concentration_factor / volume
-        vol_safe = torch.clamp(volume, min=1e-6)  # [B]
-        for si, entries in self.feed_contribs.items():
-            for fi, factor in entries:
-                dxdt[:, si] = dxdt[:, si] + feeds[:, fi] * factor / vol_safe
-
-        # 6. Dilution: −X × (vol_rate / volume), only for non-empirical states
-        dilution = vol_rate / vol_safe                              # [B]
-        dxdt = dxdt - y * dilution.unsqueeze(-1) * self.dilution_mask.unsqueeze(0)
-
-        return dxdt
-
-
-def create_model(n_clones, cfg):
-    """
-    Factory: create a KineticsNet with dimensions derived from cfg.
-
-    Args:
-        n_clones: number of unique clones (embedding vocabulary size).
-        cfg:      global configuration dict.
-
-    Returns:
-        KineticsNet instance (not yet moved to device).
-    """
-    return KineticsNet(
-        n_states=len(cfg["state_cols"]),
-        n_controls=len(cfg["control_cols"]),
-        n_statics=len(cfg["static_cols"]),
-        n_clones=n_clones,
-        emb_dim=cfg["clone_emb_dim"],
-        hidden_dim=cfg["hidden_dim"],
-    )
-
-
-# ============================================================
-# S3: ODE Integration
-# ============================================================
-
-
-def solve_batch(net, batch, stats, cfg):
-    """
-    Free-run ODE integration for a batch of experiments.
-
-    Args:
-        net: KineticsNet model.
-        batch: BatchData namedtuple (padded).
-        stats: normalisation stats dict (tensors on any device).
-        cfg: configuration dict.
-
-    Returns:
-        predictions: [B, T, n_states] predicted trajectories.
-        t_eval: [T] evaluation time points.
-    """
-    device = batch.times.device
-
-    # Determine real time range using pad_masks
-    # pad_masks: [B, T], 1 = real measurement, 0 = padding
-    max_T = batch.times.shape[1]
-    real_mask = batch.pad_masks > 0.5  # [B, T]
-    # Replace padded positions with +inf / -inf so they don't affect min/max
-    masked_times = batch.times.clone()
-    masked_times[~real_mask] = float("inf")
-    t_start = masked_times.min()
-    masked_times[~real_mask] = float("-inf")
-    t_end = masked_times.max()
-
-    t_eval = torch.linspace(
-        t_start.item(), t_end.item(), max_T, device=device
-    )
-
-    # Build interpolation closures
-    ctrl_fn = make_interp_fn(batch.times, batch.controls, method="linear")
-    feed_fn = make_interp_fn(batch.times, batch.feed_rates, method="previous")
-    vol_fn = make_volume_fn(batch.times, batch.vol_rates, batch.initial_vols)
-    vol_rate_fn = make_vol_rate_fn(batch.times, batch.vol_rates)
-
-    # Move stats tensors to the correct device
-    stats_dev = {k: v.to(device) for k, v in stats.items()}
-
-    # Build ODE right-hand side
-    ode_func = HybridODE(
-        net=net,
-        ctrl_fn=ctrl_fn,
-        feed_fn=feed_fn,
-        vol_fn=vol_fn,
-        vol_rate_fn=vol_rate_fn,
-        stats=stats_dev,
-        clone_idx=batch.clone_indices,
-        statics=batch.statics,
-        cfg=cfg,
-    )
-
-    # Initial conditions: [B, n_states]
-    y0 = batch.initial_states
-
-    # Solve ODE — solution shape: [T, B, n_states]
-    solution = odeint(
-        ode_func,
-        y0,
-        t_eval,
-        method=cfg["ode_method"],
-        rtol=cfg["ode_rtol"],
-        atol=cfg["ode_atol"],
-    )
-
-    # Transpose to [B, T, n_states]
-    predictions = solution.permute(1, 0, 2)
-
-    # NaN guard: warn and replace with zeros
-    if torch.isnan(predictions).any():
-        logger.warning("NaN detected in ODE solution — clamping to 0.")
-        predictions = torch.nan_to_num(predictions, nan=0.0)
-
-    return predictions, t_eval
-
-
-def interp_to_targets(preds, pred_times, target_times, pad_masks):
-    """
-    Vectorised linear interpolation of ODE predictions to measurement times.
-
-    Args:
-        preds: [B, T_pred, n_states] ODE solution on a uniform grid.
-        pred_times: [T_pred] ODE evaluation time points (sorted).
-        target_times: [B, T_target] per-experiment measurement times.
-        pad_masks: [B, T_target] 1 = real, 0 = padding.
-
-    Returns:
-        interp_preds: [B, T_target, n_states] interpolated predictions.
-    """
-    B, T_target = target_times.shape
-    n_states = preds.shape[2]
-    device = preds.device
-
-    # Flatten target times for a single searchsorted call
-    flat_t = target_times.reshape(-1)  # [B * T_target]
-
-    # Find right-side insertion indices, clamp to valid range [1, T_pred-1]
-    idx_hi = torch.searchsorted(pred_times, flat_t).clamp(1, len(pred_times) - 1)
-    idx_lo = idx_hi - 1
-
-    t_lo = pred_times[idx_lo]  # [B*T_target]
-    t_hi = pred_times[idx_hi]  # [B*T_target]
-    alpha = ((flat_t - t_lo) / (t_hi - t_lo + 1e-8)).clamp(0.0, 1.0)  # [B*T_target]
-
-    # Reshape indices for gather: [B, T_target]
-    idx_lo = idx_lo.view(B, T_target)
-    idx_hi = idx_hi.view(B, T_target)
-    alpha = alpha.view(B, T_target, 1)  # [B, T_target, 1] for broadcasting
-
-    # Gather predictions at lo/hi indices: expand to [B, T_target, n_states]
-    idx_lo_exp = idx_lo.unsqueeze(-1).expand(-1, -1, n_states)
-    idx_hi_exp = idx_hi.unsqueeze(-1).expand(-1, -1, n_states)
-
-    preds_lo = torch.gather(preds, 1, idx_lo_exp)  # [B, T_target, n_states]
-    preds_hi = torch.gather(preds, 1, idx_hi_exp)  # [B, T_target, n_states]
-
-    interp_preds = (1.0 - alpha) * preds_lo + alpha * preds_hi
-
-    # Zero out padding positions
-    mask = (pad_masks > 0.5).unsqueeze(-1)  # [B, T_target, 1]
-    interp_preds = interp_preds * mask
-
-    return interp_preds
-
-
-# -- Stepwise helpers --------------------------------------------------------
-
-
-def _find_ground_truth(batch, target_time, tolerance):
-    """
-    Find observations closest to *target_time* within *tolerance* (hours).
-
-    Returns:
-        y_true: [B, n_states] ground-truth state values (0 where unavailable).
-        mask: [B, n_states] observation mask (1 = observed, 0 = missing).
-        has_reset: bool — True if at least one experiment had a valid observation.
-    """
-    B, T, n_states = batch.states.shape
-    device = batch.states.device
-    y_true = torch.zeros(B, n_states, device=device)
-    mask = torch.zeros(B, n_states, device=device)
-    has_reset = False
-
-    for b in range(B):
-        valid = batch.pad_masks[b] > 0.5
-        valid_times = batch.times[b, valid]
-        if len(valid_times) == 0:
-            continue
-        diffs = torch.abs(valid_times - target_time)
-        min_diff, min_idx = diffs.min(dim=0)
-        if min_diff.item() <= tolerance:
-            orig_idx = valid.nonzero(as_tuple=False)[min_idx].item()
-            y_true[b] = batch.states[b, orig_idx]
-            mask[b] = batch.obs_masks[b, orig_idx]
-            has_reset = True
-
-    return y_true, mask, has_reset
-
-
-def solve_batch_stepwise(net, batch, stats, cfg):
-    """
-    Stepwise ODE integration with periodic state resets from observations.
-
-    Splits the time horizon into segments of ``cfg["step_size_hours"]``.
-    At each segment boundary the predicted state is replaced by ground-truth
-    observations (where available within ``cfg["reset_tolerance"]`` hours).
-
-    Args:
-        net: KineticsNet model.
-        batch: BatchData namedtuple.
-        stats: normalisation stats dict.
-        cfg: configuration dict.
-
-    Returns:
-        predictions: [B, T_total, n_states] concatenated trajectory.
-        pred_times: [T_total] time points.
-        reset_times: list of float times where resets occurred.
-    """
-    device = batch.times.device
-    step_size = cfg["step_size_hours"]
-    tolerance = cfg["reset_tolerance"]
-
-    # Determine real time range
-    real_mask = batch.pad_masks > 0.5
-    masked_times = batch.times.clone()
-    masked_times[~real_mask] = float("inf")
-    t_start = masked_times.min().item()
-    masked_times[~real_mask] = float("-inf")
-    t_end = masked_times.max().item()
-
-    # Segment boundaries
-    boundaries = []
-    t = t_start
-    while t < t_end - 1e-6:
-        boundaries.append(t)
-        t += step_size
-    boundaries.append(t_end)
-
-    # Shared interpolation closures (cover the full time span)
-    ctrl_fn = make_interp_fn(batch.times, batch.controls, method="linear")
-    feed_fn = make_interp_fn(batch.times, batch.feed_rates, method="previous")
-    vol_fn = make_volume_fn(batch.times, batch.vol_rates, batch.initial_vols)
-    vol_rate_fn = make_vol_rate_fn(batch.times, batch.vol_rates)
-    stats_dev = {k: v.to(device) for k, v in stats.items()}
-
-    # Per-segment ODE solve
-    y_current = batch.initial_states.clone()  # [B, n_states]
-    all_preds = []  # list of [B, T_seg, n_states]
-    all_times = []  # list of [T_seg]
-    reset_times = []
-    n_pts_per_seg = max(batch.times.shape[1] // max(len(boundaries) - 1, 1), 4)
-
-    for i in range(len(boundaries) - 1):
-        seg_start = boundaries[i]
-        seg_end = boundaries[i + 1]
-        t_seg = torch.linspace(seg_start, seg_end, n_pts_per_seg, device=device)
-
-        ode_func = HybridODE(
-            net=net,
-            ctrl_fn=ctrl_fn,
-            feed_fn=feed_fn,
-            vol_fn=vol_fn,
-            vol_rate_fn=vol_rate_fn,
-            stats=stats_dev,
-            clone_idx=batch.clone_indices,
-            statics=batch.statics,
-            cfg=cfg,
-        )
-
-        solution = odeint(
-            ode_func,
-            y_current,
-            t_seg,
-            method=cfg["ode_method"],
-            rtol=cfg["ode_rtol"],
-            atol=cfg["ode_atol"],
-        )  # [T_seg, B, n_states]
-
-        seg_preds = solution.permute(1, 0, 2)  # [B, T_seg, n_states]
-
-        # NaN guard
-        if torch.isnan(seg_preds).any():
-            logger.warning(
-                "NaN in stepwise segment %d (%.1f–%.1f h) — clamping.",
-                i, seg_start, seg_end,
-            )
-            seg_preds = torch.nan_to_num(seg_preds, nan=0.0)
-
-        # Avoid duplicating boundary points between consecutive segments
-        if i > 0:
-            seg_preds = seg_preds[:, 1:]
-            t_seg = t_seg[1:]
-
-        all_preds.append(seg_preds)
-        all_times.append(t_seg)
-
-        # State reset at segment boundary
-        y_pred_end = seg_preds[:, -1]  # [B, n_states]
-        y_true, obs_mask, has_reset = _find_ground_truth(
-            batch, seg_end, tolerance
-        )
-        if has_reset:
-            y_current = obs_mask * y_true + (1.0 - obs_mask) * y_pred_end
-            reset_times.append(seg_end)
-        else:
-            y_current = y_pred_end
-
-    predictions = torch.cat(all_preds, dim=1)  # [B, T_total, n_states]
-    pred_times = torch.cat(all_times, dim=0)  # [T_total]
-    return predictions, pred_times, reset_times
-
-
-# -- Ensemble wrappers -------------------------------------------------------
-
-
-def solve_ensemble(models, batch, stats, cfg):
-    """
-    Free-run ODE with each ensemble member; return mean, std, and all.
-
-    Returns:
-        mean_preds: [B, T, n_states]
-        std_preds: [B, T, n_states]
-        all_preds: [N, B, T, n_states]
-        t_eval: [T]
-    """
-    all_preds = []
-    t_eval = None
-    for net in models:
-        net.eval()
-        with torch.no_grad():
-            preds, t_eval = solve_batch(net, batch, stats, cfg)
-            all_preds.append(preds)
-    all_preds = torch.stack(all_preds, dim=0)  # [N, B, T, n_states]
-    mean_preds = all_preds.mean(dim=0)
-    std_preds = all_preds.std(dim=0)
-    return mean_preds, std_preds, all_preds, t_eval
-
-
-def solve_ensemble_stepwise(models, batch, stats, cfg):
-    """
-    Stepwise ODE with each ensemble member; return mean, std, and all.
-
-    Returns:
-        mean_preds: [B, T_total, n_states]
-        std_preds: [B, T_total, n_states]
-        all_preds: [N, B, T_total, n_states]
-        pred_times: [T_total]
-        reset_times: list of float reset boundary times.
-    """
-    all_preds = []
-    pred_times = None
-    reset_times = None
-    for net in models:
-        net.eval()
-        with torch.no_grad():
-            preds, pred_times, reset_times = solve_batch_stepwise(
-                net, batch, stats, cfg
-            )
-            all_preds.append(preds)
-    all_preds = torch.stack(all_preds, dim=0)  # [N, B, T_total, n_states]
-    mean_preds = all_preds.mean(dim=0)
-    std_preds = all_preds.std(dim=0)
-    return mean_preds, std_preds, all_preds, pred_times, reset_times
-
-
-# ============================================================
-# S4: Training
-# ============================================================
-
-
-def masked_nrmse(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    obs_mask: torch.Tensor,
-    state_std: torch.Tensor,
-) -> torch.Tensor:
-    """Compute masked normalized RMSE per state variable.
-
-    Args:
-        pred: [B, T, n_states] predicted values.
-        target: [B, T, n_states] observed values.
-        obs_mask: [B, T, n_states] — 1 where observed, 0 otherwise.
-        state_std: [n_states] — normalization denominator.
-
-    Returns:
-        nrmse: [n_states] — per-variable normalized RMSE.
-    """
-    diff = (pred - target) * obs_mask
-    n_obs = obs_mask.sum(dim=(0, 1)).clamp(min=1.0)
-    mse = (diff ** 2).sum(dim=(0, 1)) / n_obs
-    rmse = torch.sqrt(mse)
-    return rmse / state_std.clamp(min=1e-6)
-
-
-def _evaluate_nrmse(
-    net: nn.Module,
-    data: dict,
-    exp_ids: list,
-    stats: dict,
-    cfg: dict,
-    device: torch.device,
-) -> float:
-    """Compute average NRMSE on given experiment IDs (no grad)."""
-    if not exp_ids:
-        return float("inf")
-
-    net.eval()
-    state_std = stats["state_std"].to(device)
-    all_nrmse: list[float] = []
-    batch_size = cfg["batch_size"]
-
-    with torch.no_grad():
-        for i in range(0, len(exp_ids), batch_size):
-            batch_ids = exp_ids[i : i + batch_size]
-            batch = make_batch(batch_ids, data, device)
-            try:
-                preds, t_eval = solve_batch(net, batch, stats, cfg)
-                if torch.isnan(preds).any():
-                    continue
-                interp = interp_to_targets(preds, t_eval, batch.times, batch.pad_masks)
-                nrmse = masked_nrmse(interp, batch.states, batch.obs_masks, state_std)
-                all_nrmse.append(nrmse.mean().item())
-            except Exception as e:
-                logger.debug("Eval batch skipped: %s", e)
-                continue
-
-    return float(np.mean(all_nrmse)) if all_nrmse else float("inf")
-
-
-def train_one_model(
-    net: nn.Module,
-    data: dict,
-    train_ids: list,
-    val_ids: list,
-    stats: dict,
-    cfg: dict,
-    device: torch.device,
-    label: str = "",
-) -> tuple:
-    """Train a single KineticsNet with early stopping.
-
-    Returns:
-        net: trained model (loaded from best checkpoint in memory).
-        history: {"train_loss": [...], "val_nrmse": [...]}.
-    """
-    net = net.to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-
-    warmup_epochs = cfg['warmup_epochs']
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, 
-        start_factor=0.01,  # 从设定学习率的 1% 开始 (即 2e-5)
-        total_iters=warmup_epochs
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,       # 每次衰减为原来的一半 (比如 2e-3 -> 1e-3)
-            patience=8,       # 容忍 8 个 epoch 不下降就开始衰减 LR
-            min_lr=1e-5       # 学习率兜底下限
-        )
-
-    best_val = float("inf")
-    best_state: dict | None = None
-    patience_counter = 0
-    history: dict[str, list[float]] = {"train_loss": [], "val_nrmse": []}
-
-    state_std = stats["state_std"].to(device)
-
-    for epoch in range(cfg["epochs"]):
-        net.train()
-        epoch_loss = 0.0
-        n_batches = 0
-
-        # Shuffle training IDs
-        perm = np.random.permutation(train_ids)
-        batch_size = cfg["batch_size"]
-
-        for i in range(0, len(perm), batch_size):
-            batch_ids = list(perm[i : i + batch_size])
-            batch = make_batch(batch_ids, data, device)
-
-            optimizer.zero_grad()
-            try:
-                preds, t_eval = solve_batch(net, batch, stats, cfg)
-                if torch.isnan(preds).any():
-                    logger.warning(
-                        "%s Epoch %d batch %d: NaN in predictions, skipping",
-                        label, epoch + 1, i,
-                    )
-                    continue
-
-                interp = interp_to_targets(preds, t_eval, batch.times, batch.pad_masks)
-                nrmse_vec = masked_nrmse(interp, batch.states, batch.obs_masks, state_std)
-                loss = nrmse_vec.mean()
-
-                if torch.isnan(loss):
-                    continue
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), cfg["grad_clip"])
-                optimizer.step()
-
-                epoch_loss += loss.item()
-                n_batches += 1
-            except Exception as e:
-                logger.warning("%s Epoch %d batch %d: %s", label, epoch + 1, i, e)
-                continue
-
-        avg_loss = epoch_loss / max(n_batches, 1)
-        history["train_loss"].append(avg_loss)
-
-        # Validation
-        net.eval()
-        val_nrmse = _evaluate_nrmse(net, data, val_ids, stats, cfg, device)
-        history["val_nrmse"].append(val_nrmse)
-
-        if epoch < warmup_epochs:
-            warmup_scheduler.step()
-        else:
-            scheduler.step(val_nrmse)
-
-        current_lr = optimizer.param_groups[0]['lr']
-
-        # Early stopping
-        if val_nrmse < best_val:
-            best_val = val_nrmse
-            best_state = copy.deepcopy(net.state_dict())
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            logger.info(
-                "%s Epoch %03d | LR: %.2e | Loss: %.5f | Val NRMSE: %.4f | Best: %.4f",
-                label, epoch + 1, current_lr, avg_loss, val_nrmse, best_val,
-            )
-        
-        if patience_counter >= cfg["patience"]:
-            logger.info("%s Early stopping at epoch %d", label, epoch + 1)
-            break
-
-    # Restore best model
-    if best_state is not None:
-        net.load_state_dict(best_state)
-
-    return net, history
-
-
-def train_ensemble(
-    data: dict,
-    train_ids: list,
-    val_ids: list,
-    stats: dict,
-    n_clones: int,
-    cfg: dict,
-    device: torch.device,
-) -> tuple:
-    """Train an ensemble of KineticsNet models using K-fold CV.
-
-    Uses product-stratified K-fold: each fold has balanced clone representation.
-
-    Returns:
-        models: list of n_ensemble trained KineticsNet.
-        histories: list of n_ensemble history dicts.
-    """
-    n_ensemble = cfg["n_ensemble"]
-    all_train = train_ids + val_ids  # combine for K-fold splitting
-
-    # Build stratification labels (clone index for each experiment)
-    strat_labels = [data[eid].clone_idx for eid in all_train]
-
-    skf = StratifiedKFold(n_splits=n_ensemble, shuffle=True, random_state=cfg["seed"])
-
-    models: list[nn.Module] = []
-    histories: list[dict] = []
-
-    for fold_idx, (fold_train_idx, fold_val_idx) in enumerate(
-        skf.split(all_train, strat_labels)
-    ):
-        logger.info("--- Ensemble model %d/%d ---", fold_idx + 1, n_ensemble)
-
-        # Set different seed per fold for model initialization
-        torch.manual_seed(cfg["seed"] + fold_idx * 100)
-        np.random.seed(cfg["seed"] + fold_idx * 100)
-
-        fold_train = [all_train[i] for i in fold_train_idx]
-        fold_val = [all_train[i] for i in fold_val_idx]
-
-        net = create_model(n_clones, cfg).to(device)
-        net, history = train_one_model(
-            net, data, fold_train, fold_val, stats, cfg, device,
-            label=f"[Model {fold_idx}]",
-        )
-
-        models.append(net)
-        histories.append(history)
-
-    logger.info("Ensemble training complete: %d models", len(models))
-    return models, histories
-
-
-# ============================================================
-# S5: Evaluation & Metrics
-# ============================================================
-
-
-def compute_metrics(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    obs_mask: torch.Tensor,
-    state_std: torch.Tensor,
-) -> dict:
-    """Compute comprehensive evaluation metrics.
-
-    Args:
-        pred: [B, T, n_states] predictions.
-        target: [B, T, n_states] ground truth.
-        obs_mask: [B, T, n_states] observation mask (1=observed).
-        state_std: [n_states] for NRMSE normalization.
-
-    Returns:
-        dict with per_var_{nrmse,mape,r2,mae} (numpy) and avg_* (float).
-    """
-    # NRMSE — reuse existing helper
-    nrmse = masked_nrmse(pred, target, obs_mask, state_std)
-
-    # MAPE — skip near-zero targets to avoid division issues
-    target_safe = torch.where(
-        torch.abs(target) > 1e-6, target, torch.ones_like(target),
-    )
-    valid_mask = obs_mask * (torch.abs(target) > 1e-6).float()
-    abs_pct = torch.abs((pred - target) / target_safe) * valid_mask
-    n_valid = valid_mask.sum(dim=(0, 1)).clamp(min=1.0)
-    mape = (abs_pct.sum(dim=(0, 1)) / n_valid) * 100.0
-
-    # R² — coefficient of determination
-    n_obs = obs_mask.sum(dim=(0, 1)).clamp(min=1.0)
-    ss_res = ((pred - target) ** 2 * obs_mask).sum(dim=(0, 1))
-    target_mean = (target * obs_mask).sum(dim=(0, 1)) / n_obs
-    ss_tot = (
-        (target - target_mean.unsqueeze(0).unsqueeze(0)) ** 2 * obs_mask
-    ).sum(dim=(0, 1))
-    r2 = 1.0 - ss_res / ss_tot.clamp(min=1e-8)
-
-    # MAE — mean absolute error
-    abs_err = torch.abs(pred - target) * obs_mask
-    mae = abs_err.sum(dim=(0, 1)) / n_obs
-
-    return {
-        "per_var_nrmse": nrmse.detach().cpu().numpy(),
-        "avg_nrmse": nrmse.mean().item(),
-        "per_var_mape": mape.detach().cpu().numpy(),
-        "avg_mape": mape.mean().item(),
-        "per_var_r2": r2.detach().cpu().numpy(),
-        "avg_r2": r2.mean().item(),
-        "per_var_mae": mae.detach().cpu().numpy(),
-        "avg_mae": mae.mean().item(),
-    }
-
-
-def evaluate_ensemble(models, data, exp_ids, stats, cfg, device):
-    """Evaluate ensemble on given experiments using free-run prediction.
-
-    Runs free-run ODE integration for each batch, interpolates to observed
-    time points, then computes NRMSE / MAPE / R² / MAE.
-
-    Returns:
-        dict with avg_nrmse, avg_mape, avg_r2, avg_mae and per_var versions.
-    """
-    if not exp_ids:
-        return {
-            "avg_nrmse": float("inf"),
-            "avg_r2": 0.0,
-            "avg_mape": float("inf"),
-            "avg_mae": float("inf"),
-        }
-
-    state_std = stats["state_std"].to(device)
-
-    all_preds: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
-    all_masks: list[torch.Tensor] = []
-
-    batch_size = cfg["batch_size"]
-    for i in range(0, len(exp_ids), batch_size):
-        batch_ids = exp_ids[i : i + batch_size]
-        batch = make_batch(batch_ids, data, device)
-
-        # Ensemble mean prediction (free-run)
-        mean_pred, _, _, t_eval = solve_ensemble(models, batch, stats, cfg)
-        interp = interp_to_targets(mean_pred, t_eval, batch.times, batch.pad_masks)
-
-        all_preds.append(interp)
-        all_targets.append(batch.states)
-        all_masks.append(batch.obs_masks)
-
-    pred_cat = torch.cat(all_preds, dim=0)
-    target_cat = torch.cat(all_targets, dim=0)
-    mask_cat = torch.cat(all_masks, dim=0)
-
-    return compute_metrics(pred_cat, target_cat, mask_cat, state_std)
-
-
-def evaluate_stepwise(models, data, exp_ids, stats, cfg, device):
-    """Evaluate ensemble with stepwise prediction (data assimilation).
-
-    Same return format as evaluate_ensemble, plus ``avg_n_resets``.
-    """
-    if not exp_ids:
-        return {
-            "avg_nrmse": float("inf"),
-            "avg_r2": 0.0,
-            "avg_mape": float("inf"),
-            "avg_mae": float("inf"),
-        }
-
-    state_std = stats["state_std"].to(device)
-
-    all_preds: list[torch.Tensor] = []
-    all_targets: list[torch.Tensor] = []
-    all_masks: list[torch.Tensor] = []
-    all_resets: list[int] = []
-
-    batch_size = cfg["batch_size"]
-    for i in range(0, len(exp_ids), batch_size):
-        batch_ids = exp_ids[i : i + batch_size]
-        batch = make_batch(batch_ids, data, device)
-
-        mean_pred, _, _, pred_times, reset_times = solve_ensemble_stepwise(
-            models, batch, stats, cfg,
-        )
-        interp = interp_to_targets(
-            mean_pred, pred_times, batch.times, batch.pad_masks,
-        )
-
-        all_preds.append(interp)
-        all_targets.append(batch.states)
-        all_masks.append(batch.obs_masks)
-        all_resets.append(len(reset_times))
-
-    pred_cat = torch.cat(all_preds, dim=0)
-    target_cat = torch.cat(all_targets, dim=0)
-    mask_cat = torch.cat(all_masks, dim=0)
-
-    metrics = compute_metrics(pred_cat, target_cat, mask_cat, state_std)
-    metrics["avg_n_resets"] = float(np.mean(all_resets)) if all_resets else 0.0
-    return metrics
-
-
-# ============================================================
-# S6: Few-Shot Adaptation
-# ============================================================
-
-
-def extend_clone_embedding(net, mean_init=True):
-    """Add one new clone to the embedding table.
-
-    Args:
-        net: KineticsNet model (modified in-place).
-        mean_init: if True, init new row as mean of existing embeddings.
-
-    Returns:
-        net: modified model.
-        new_idx: integer index of the new clone.
-    """
-    old_emb = net.clone_emb
-    n_old = old_emb.num_embeddings
-    emb_dim = old_emb.embedding_dim
-
-    new_emb = nn.Embedding(n_old + 1, emb_dim)
-    with torch.no_grad():
-        new_emb.weight[:n_old] = old_emb.weight.data.clone()
-        if mean_init:
-            new_emb.weight[n_old] = old_emb.weight.data.mean(dim=0)
-        # else: random init from nn.Embedding default
-
-    device = next(net.parameters()).device
-    net.clone_emb = new_emb.to(device)
-    return net, n_old  # new_idx = n_old (0-indexed)
-
-
-def freeze_for_mode(net, mode, new_idx):
-    """Freeze/unfreeze parameters for few-shot adaptation.
-
-    Args:
-        net: KineticsNet with extended embedding.
-        mode: "embedding_only" or "head_tuning".
-        new_idx: index of the new clone embedding row.
-
-    Returns:
-        trainable_params: list of parameters that require grad.
-    """
-    # Freeze everything first
-    for p in net.parameters():
-        p.requires_grad = False
-
-    def _last_row_hook(grad):
-        mask = torch.zeros_like(grad)
-        mask[new_idx] = 1.0
-        return grad * mask
-
-    if mode == "embedding_only":
-        # Unfreeze embedding weights, mask gradient to only update last row
-        net.clone_emb.weight.requires_grad = True
-        net.clone_emb.weight.register_hook(_last_row_hook)
-        return [net.clone_emb.weight]
-
-    elif mode == "head_tuning":
-        # Unfreeze embedding (last row only via hook) + last Linear layer
-        net.clone_emb.weight.requires_grad = True
-        net.clone_emb.weight.register_hook(_last_row_hook)
-
-        # Last layer of the Sequential network (Linear, Tanh, ..., Linear)
-        last_layer = net.net[-1]
-        for p in last_layer.parameters():
-            p.requires_grad = True
-
-        return [net.clone_emb.weight] + list(last_layer.parameters())
-
-    elif mode == "full_head_tuning":
-        # Unfreeze ENTIRE embedding layer + last Linear layer. No gradient hook!
-        net.clone_emb.weight.requires_grad = True
-
-        # Last layer of the Sequential network
-        last_layer = net.net[-1]
-        for p in last_layer.parameters():
-            p.requires_grad = True
-
-        return [net.clone_emb.weight] + list(last_layer.parameters())
-
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-
-def finetune_model(net, data, shot_ids, val_ids, stats, new_idx, mode, cfg, device):
-    """Fine-tune a single model for a new clone.
-
-    All shot data must already have clone_idx set to new_idx.
-
-    Args:
-        net: KineticsNet with extended embedding.
-        data: dict of ExperimentData for shot + val runs.
-        shot_ids: list of exp_ids for training.
-        val_ids: list of exp_ids for validation.
-        stats: normalization stats dict.
-        new_idx: index of the new clone in the embedding table.
-        mode: "embedding_only" or "head_tuning".
-        cfg: config dict.
-        device: torch device.
-
-    Returns:
-        net: fine-tuned model with best checkpoint restored.
-    """
-    net = net.to(device)
-    trainable = freeze_for_mode(net, mode, new_idx)
-    optimizer = torch.optim.Adam(trainable, lr=cfg["finetune_lr"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-5
-        )
-    best_val = float("inf")
-    best_state = None
-    patience_counter = 0
-    state_std = stats["state_std"].to(device)
-
-    for epoch in range(cfg["finetune_epochs"]):
-        net.train()
-        batch = make_batch(shot_ids, data, device)
-        # Override clone indices to new_idx
-        batch = batch._replace(
-            clone_indices=torch.full_like(batch.clone_indices, new_idx),
-        )
-
-        optimizer.zero_grad()
-        train_loss = None
-        try:
-            preds, t_eval = solve_batch(net, batch, stats, cfg)
-            if torch.isnan(preds).any():
-                continue
-            interp = interp_to_targets(preds, t_eval, batch.times, batch.pad_masks)
-            train_loss = masked_nrmse(
-                interp, batch.states, batch.obs_masks, state_std,
-            ).mean()
-            if torch.isnan(train_loss):
-                continue
-            train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, cfg["grad_clip"])
-            optimizer.step()
-        except Exception as e:
-            logger.debug("Finetune batch skipped: %s", e)
-            continue
-
-        # Validation
-        if val_ids:
-            net.eval()
-            with torch.no_grad():
-                val_batch = make_batch(val_ids, data, device)
-                val_batch = val_batch._replace(
-                    clone_indices=torch.full_like(
-                        val_batch.clone_indices, new_idx,
-                    ),
-                )
-                vp, vt = solve_batch(net, val_batch, stats, cfg)
-                vi = interp_to_targets(
-                    vp, vt, val_batch.times, val_batch.pad_masks,
-                )
-                val_nrmse = masked_nrmse(
-                    vi, val_batch.states, val_batch.obs_masks, state_std,
-                ).mean().item()
-        else:
-            val_nrmse = train_loss.item()  # use train loss as proxy
-
-        scheduler.step(val_nrmse)
-
-        if val_nrmse < best_val:
-            best_val = val_nrmse
-            best_state = copy.deepcopy(net.state_dict())
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if patience_counter >= cfg["finetune_patience"]:
-            break
-
-    if best_state is not None:
-        net.load_state_dict(best_state)
-    return net
-
-
-def retrain_with_shots(data, base_train_ids, base_val_ids, shot_ids,
-                       stats, n_clones, cfg, device):
-    """Retrain ensemble from scratch with base data + shot holdout runs.
-
-    The holdout clone IS in the vocabulary (n_clones already includes it).
-    """
-    combined_train = base_train_ids + shot_ids
-    models, _ = train_ensemble(
-        data, combined_train, base_val_ids, stats, n_clones, cfg, device,
-    )
-    return models
-
-
-def run_transfer_experiment(models, base_data, holdout_data, holdout_clone,
-                            base_train_ids, base_val_ids, stats, vocab,
-                            cfg, device):
-    """Run transfer learning experiment: 3 methods x 3 shots.
-
-    Methods: retrain, embedding_only, head_tuning.
-    Shots: 0, 2, 4.
-
-    Args:
-        models: pre-trained ensemble (list of KineticsNet).
-        base_data: dict of ExperimentData for base clones.
-        holdout_data: dict of ExperimentData for holdout clone.
-        holdout_clone: name of the holdout clone.
-        base_train_ids: list of base training exp_ids.
-        base_val_ids: list of base validation exp_ids.
-        stats: normalization stats dict.
-        vocab: vocabulary dict with n_clones, clone_names.
-        cfg: config dict.
-        device: torch device.
-
-    Returns:
-        results: {method: {n_shot: {"nrmse": float, "r2": float}}}.
-    """
-    holdout_ids = list(holdout_data.keys())
-    n_holdout = len(holdout_ids)
-
-    # Deterministic shuffle for reproducible shot selection
-    rng = np.random.RandomState(cfg["seed"])
-    shuffled = holdout_ids.copy()
-    rng.shuffle(shuffled)
-
-    results = {}
-    n_clones = vocab["n_clones"]  # base clones count (holdout excluded)
-
-    # ===== 0-shot (shared across all methods) =====
-    logger.info("=== 0-shot evaluation (shared) ===")
-
-    # Extend each model's embedding with mean init
-    zero_shot_models = []
-    new_idx = None
-    for net in models:
-        net_copy = copy.deepcopy(net)
-        net_copy, new_idx = extend_clone_embedding(net_copy, mean_init=True)
-        zero_shot_models.append(net_copy)
-
-    # Override holdout data clone_indices to new_idx
-    holdout_data_adapted = {}
-    for eid, exp in holdout_data.items():
-        holdout_data_adapted[eid] = exp._replace(clone_idx=new_idx)
-
-    all_data_adapted = {**base_data, **holdout_data_adapted}
-
-    # Evaluate 0-shot on ALL holdout runs
-    zero_metrics = evaluate_ensemble(
-        zero_shot_models, all_data_adapted, holdout_ids, stats, cfg, device,
-    )
-    zero_shot_result = {
-        "nrmse": zero_metrics["avg_nrmse"],
-        "r2": zero_metrics["avg_r2"],
-    }
-
-    for method in ["retrain", "embedding_only", "head_tuning", "full_head_tuning"]:
-        results[method] = {0: zero_shot_result}  # shared 0-shot
-
-    logger.info(
-        "0-shot — NRMSE: %.4f, R²: %.4f",
-        zero_shot_result["nrmse"], zero_shot_result["r2"],
-    )
-
-    # ===== 2-shot and 4-shot =====
-    for n_shot in [2, 4]:
-        if n_shot > n_holdout:
-            logger.warning(
-                "Not enough holdout runs (%d) for %d-shot", n_holdout, n_shot,
-            )
-            continue
-
-        shot_ids = shuffled[:n_shot]
-        eval_ids = shuffled[n_shot:]  # remaining holdout runs for evaluation
-
-        if not eval_ids:
-            logger.warning("No evaluation runs left for %d-shot", n_shot)
-            continue
-
-        logger.info(
-            "=== %d-shot: %d train, %d eval ===",
-            n_shot, n_shot, len(eval_ids),
-        )
-
-        # Few-shot: use all shots for training, no val split (too few runs)
-        ft_train_ids = shot_ids
-        ft_val_ids = []
-
-        # --- Method 1: Retrain ---
-        logger.info("  Retrain from scratch...")
-        # Holdout clone gets index n_clones in extended vocabulary
-        retrain_data = {**base_data}
-        for eid in shot_ids:
-            retrain_data[eid] = holdout_data[eid]._replace(clone_idx=n_clones)
-
-        retrain_models = retrain_with_shots(
-            retrain_data, base_train_ids, base_val_ids, shot_ids,
-            stats, n_clones + 1, cfg, device,
-        )
-
-        # Evaluate retrain on remaining holdout
-        eval_data_retrain = {}
-        for eid in eval_ids:
-            eval_data_retrain[eid] = holdout_data[eid]._replace(
-                clone_idx=n_clones,
-            )
-        retrain_data_full = {**base_data, **eval_data_retrain}
-
-        r_metrics = evaluate_ensemble(
-            retrain_models, retrain_data_full, eval_ids, stats, cfg, device,
-        )
-        results["retrain"][n_shot] = {
-            "nrmse": r_metrics["avg_nrmse"],
-            "r2": r_metrics["avg_r2"],
-        }
-        logger.info(
-            "  Retrain %d-shot — NRMSE: %.4f, R²: %.4f",
-            n_shot, r_metrics["avg_nrmse"], r_metrics["avg_r2"],
-        )
-
-        # --- Method 2: Embedding-only ---
-        logger.info("  Embedding-only finetune...")
-        emb_models = []
-        for net in models:
-            net_copy = copy.deepcopy(net)
-            net_copy, ni = extend_clone_embedding(net_copy, mean_init=True)
-            adapted_shot = {}
-            for eid in shot_ids:
-                adapted_shot[eid] = holdout_data[eid]._replace(clone_idx=ni)
-            ft_train_adapted = list(adapted_shot.keys())[:len(ft_train_ids)]
-            ft_val_adapted = list(adapted_shot.keys())[len(ft_train_ids):]
-            net_copy = finetune_model(
-                net_copy, adapted_shot, ft_train_adapted, ft_val_adapted,
-                stats, ni, "embedding_only", cfg, device,
-            )
-            emb_models.append(net_copy)
-
-        eval_data_emb = {}
-        for eid in eval_ids:
-            eval_data_emb[eid] = holdout_data[eid]._replace(clone_idx=n_clones)
-        emb_data_full = {**base_data, **eval_data_emb}
-
-        e_metrics = evaluate_ensemble(
-            emb_models, emb_data_full, eval_ids, stats, cfg, device,
-        )
-        results["embedding_only"][n_shot] = {
-            "nrmse": e_metrics["avg_nrmse"],
-            "r2": e_metrics["avg_r2"],
-        }
-        logger.info(
-            "  Embedding %d-shot — NRMSE: %.4f, R²: %.4f",
-            n_shot, e_metrics["avg_nrmse"], e_metrics["avg_r2"],
-        )
-
-        # --- Method 3: Head-tuning ---
-        logger.info("  Head-tuning finetune...")
-        ht_models = []
-        for net in models:
-            net_copy = copy.deepcopy(net)
-            net_copy, ni = extend_clone_embedding(net_copy, mean_init=True)
-            adapted_shot = {}
-            for eid in shot_ids:
-                adapted_shot[eid] = holdout_data[eid]._replace(clone_idx=ni)
-            ft_train_adapted = list(adapted_shot.keys())[:len(ft_train_ids)]
-            ft_val_adapted = list(adapted_shot.keys())[len(ft_train_ids):]
-            net_copy = finetune_model(
-                net_copy, adapted_shot, ft_train_adapted, ft_val_adapted,
-                stats, ni, "head_tuning", cfg, device,
-            )
-            ht_models.append(net_copy)
-
-        eval_data_ht = {}
-        for eid in eval_ids:
-            eval_data_ht[eid] = holdout_data[eid]._replace(clone_idx=n_clones)
-        ht_data_full = {**base_data, **eval_data_ht}
-
-        h_metrics = evaluate_ensemble(
-            ht_models, ht_data_full, eval_ids, stats, cfg, device,
-        )
-        results["head_tuning"][n_shot] = {
-            "nrmse": h_metrics["avg_nrmse"],
-            "r2": h_metrics["avg_r2"],
-        }
-        logger.info(
-            "  Head-tune %d-shot — NRMSE: %.4f, R²: %.4f",
-            n_shot, h_metrics["avg_nrmse"], h_metrics["avg_r2"],
-        )
-
-        # --- Method 4: Full Head-tuning ---
-        logger.info("  Full Head-tuning finetune...")
-        fht_models = []
-        for net in models:
-            net_copy = copy.deepcopy(net)
-            net_copy, ni = extend_clone_embedding(net_copy, mean_init=True)
-            adapted_shot = {}
-            for eid in shot_ids:
-                adapted_shot[eid] = holdout_data[eid]._replace(clone_idx=ni)
-            ft_train_adapted = list(adapted_shot.keys())[:len(ft_train_ids)]
-            ft_val_adapted = list(adapted_shot.keys())[len(ft_train_ids):]
-            net_copy = finetune_model(
-                net_copy, adapted_shot, ft_train_adapted, ft_val_adapted,
-                stats, ni, "full_head_tuning", cfg, device,
-            )
-            fht_models.append(net_copy)
-
-        eval_data_fht = {}
-        for eid in eval_ids:
-            eval_data_fht[eid] = holdout_data[eid]._replace(clone_idx=n_clones)
-        fht_data_full = {**base_data, **eval_data_fht}
-
-        fh_metrics = evaluate_ensemble(
-            fht_models, fht_data_full, eval_ids, stats, cfg, device,
-        )
-        results["full_head_tuning"][n_shot] = {
-            "nrmse": fh_metrics["avg_nrmse"],
-            "r2": fh_metrics["avg_r2"],
-        }
-        logger.info(
-            "  Full Head-tune %d-shot — NRMSE: %.4f, R²: %.4f",
-            n_shot, fh_metrics["avg_nrmse"], fh_metrics["avg_r2"],
-        )
-
-    # Store 4-shot adapted models for embedding visualization
-    if 4 in results.get("retrain", {}):
-        results["models"] = {
-            "retrain": retrain_models,
-            "embedding_only": emb_models,
-            "head_tuning": ht_models,
-            "full_head_tuning": fht_models,
-        }
-
-    return results
-
-
-# ============================================================
-# S7: Visualization
-# ============================================================
-
-_METHOD_LABELS = {"retrain": "Retrain", "embedding_only": "Embed-Only", "head_tuning": "Head-Tune", "full_head_tuning": "Full-Head"}
-_SHOT_COLORS = {0: "#a6cee3", 2: "#1f78b4", 4: "#08306b"}
-
-
-def _setup_style():
-    """Apply a clean publication-ready matplotlib style."""
+def setup_style():
+    """Apply clean publication-ready matplotlib style."""
     plt.rcParams.update({
         "figure.facecolor": "white",
         "axes.facecolor": "white",
@@ -1899,611 +69,476 @@ def _setup_style():
     })
 
 
-def plot_training_metrics(histories, save_path, cfg):
-    """
-    Plot ensemble training loss and validation NRMSE curves.
+def _get_clone_colors(clone_names):
+    """Return a dict mapping clone_name → color from tab10/tab20."""
+    n = len(clone_names)
+    cmap = plt.get_cmap("tab10" if n <= 10 else "tab20")
+    return {name: cmap(i % cmap.N) for i, name in enumerate(sorted(clone_names))}
 
-    Args:
-        histories: list of dicts, one per ensemble member,
-                   each with keys "train_loss" and "val_nrmse".
-        save_path: output PNG path.
-        cfg: configuration dict.
-    """
-    _setup_style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=cfg["figsize_single"])
-    cmap = plt.get_cmap("tab10")
 
-    for i, h in enumerate(histories):
-        color = cmap(i)
-        ax1.plot(h["train_loss"], label=f"Model {i}", color=color, alpha=0.8)
-        ax2.plot(h["val_nrmse"], label=f"Model {i}", color=color, alpha=0.8)
-
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Training Loss (NRMSE)")
-    ax1.set_title("Training Loss")
-    ax1.legend(fontsize=8)
-
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Validation NRMSE")
-    ax2.set_title("Validation NRMSE")
-    ax2.legend(fontsize=8)
-
-    fig.suptitle("Ensemble Training Metrics", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
+def save_figure(fig, path, dpi=150):
+    """Save figure, close it, and log the path."""
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    logger.info("Saved %s", save_path)
+    logger.info("Saved: %s", path)
 
 
-def plot_metrics_comparison(train_metrics, val_metrics, state_cols, save_path, cfg):
-    """
-    2x2 grouped-bar chart comparing train vs val on 4 metrics.
+# ============================================================
+# Data loading
+# ============================================================
 
-    Args:
-        train_metrics / val_metrics: dicts from compute_metrics().
-        state_cols: list of state variable names for x-axis.
-        save_path: output PNG path.
-        cfg: configuration dict.
-    """
-    _setup_style()
-    metric_keys = [
-        ("per_var_nrmse", "NRMSE"),
-        ("per_var_mape", "MAPE (%)"),
-        ("per_var_r2", "R²"),
-        ("per_var_mae", "MAE"),
-    ]
-    fig, axes = plt.subplots(2, 2, figsize=cfg["figsize_grid"])
-    x = np.arange(len(state_cols))
-    w = 0.35
+def load_data(csv_path):
+    """Load CSV and validate required columns. Returns DataFrame."""
+    df = pd.read_csv(csv_path)
+    logger.info("Loaded %s: shape=%s", csv_path, df.shape)
 
-    for ax, (key, title) in zip(axes.flat, metric_keys):
-        train_vals = train_metrics[key]
-        val_vals = val_metrics[key]
-        ax.bar(x - w / 2, train_vals, w, label="Train", color="#1f77b4", alpha=0.85)
-        ax.bar(x + w / 2, val_vals, w, label="Val", color="#ff7f0e", alpha=0.85)
-        ax.set_xticks(x)
-        ax.set_xticklabels(state_cols, rotation=45, ha="right", fontsize=8)
-        ax.set_title(title)
-        ax.legend(fontsize=8)
+    # Check required columns
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        logger.error("Missing required columns: %s", missing)
+        sys.exit(1)
 
-    fig.suptitle("Metrics Comparison: Train vs Val", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
+    # Report available columns
+    available_states = [c for c in STATE_COLS if c in df.columns]
+    available_feeds = [c for c in FEED_COLS if c in df.columns]
+    available_controls = [c for c in CONTROL_COLS if c in df.columns]
+    logger.info("States: %s, Feeds: %s, Controls: %s",
+                available_states, available_feeds, available_controls)
+
+    clones = df[CLONE_COL].unique()
+    n_exp = df[EXP_ID_COL].nunique()
+    logger.info("Clones: %s (%d), Experiments: %d", list(clones), len(clones), n_exp)
+
+    # NaN diagnostics
+    nan_pct = df.isnull().mean()
+    cols_with_nan = nan_pct[nan_pct > 0]
+    if len(cols_with_nan) > 0:
+        logger.info("Columns with NaN: %s", {c: f"{v:.1%}" for c, v in cols_with_nan.items()})
+
+    return df
 
 
-def plot_freerun_vs_stepwise(fr_metrics, sw_metrics, state_cols, save_path, cfg):
-    """
-    1x2 grouped-bar chart: NRMSE and R² for freerun vs stepwise.
+# ============================================================
+# KPI computation
+# ============================================================
 
-    Annotates improvement percentage on each bar pair.
-    """
-    _setup_style()
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=cfg["figsize_single"])
-    x = np.arange(len(state_cols))
-    w = 0.35
+def compute_experiment_kpis(df):
+    """Compute per-experiment KPIs. Returns DataFrame indexed by exp_id."""
+    records = []
 
-    # --- NRMSE ---
-    fr_n = fr_metrics["per_var_nrmse"]
-    sw_n = sw_metrics["per_var_nrmse"]
-    ax1.bar(x - w / 2, fr_n, w, label="Free-run", color="#1f77b4", alpha=0.85)
-    ax1.bar(x + w / 2, sw_n, w, label="Stepwise", color="#2ca02c", alpha=0.85)
-    # Annotate improvement
-    for j in range(len(state_cols)):
-        if fr_n[j] > 1e-6:
-            imp = (fr_n[j] - sw_n[j]) / fr_n[j] * 100
-            ax1.annotate(f"{imp:+.0f}%", xy=(x[j] + w / 2, sw_n[j]),
-                         fontsize=6, ha="center", va="bottom", color="green")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(state_cols, rotation=45, ha="right", fontsize=8)
-    ax1.set_title("NRMSE")
-    ax1.legend(fontsize=8)
+    for exp_id, grp in df.groupby(EXP_ID_COL):
+        grp = grp.sort_values(TIME_COL)
+        clone = grp[CLONE_COL].iloc[0]
+        rec = {EXP_ID_COL: exp_id, CLONE_COL: clone}
 
-    # --- R² ---
-    fr_r = fr_metrics["per_var_r2"]
-    sw_r = sw_metrics["per_var_r2"]
-    ax2.bar(x - w / 2, fr_r, w, label="Free-run", color="#1f77b4", alpha=0.85)
-    ax2.bar(x + w / 2, sw_r, w, label="Stepwise", color="#2ca02c", alpha=0.85)
-    for j in range(len(state_cols)):
-        if abs(fr_r[j]) > 1e-6:
-            imp = (sw_r[j] - fr_r[j]) / abs(fr_r[j]) * 100
-            ax2.annotate(f"{imp:+.0f}%", xy=(x[j] + w / 2, sw_r[j]),
-                         fontsize=6, ha="center", va="bottom", color="green")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(state_cols, rotation=45, ha="right", fontsize=8)
-    ax2.set_title("R²")
-    ax2.legend(fontsize=8)
+        # Peak VCD
+        if "vcd" in grp.columns:
+            rec["peak_vcd"] = grp["vcd"].max()
+        else:
+            rec["peak_vcd"] = np.nan
 
-    fig.suptitle("Free-run vs Stepwise Prediction", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
+        # Final titer (last non-NaN value)
+        if "titer" in grp.columns:
+            titer_valid = grp["titer"].dropna()
+            rec["final_titer"] = titer_valid.iloc[-1] if len(titer_valid) > 0 else np.nan
+        else:
+            rec["final_titer"] = np.nan
 
+        # Max lactate
+        if "lac" in grp.columns:
+            rec["max_lac"] = grp["lac"].max()
+        else:
+            rec["max_lac"] = np.nan
 
-def plot_embeddings(models, clone_names, save_path, cfg):
-    """
-    2D PCA scatter of learned clone embeddings (averaged across ensemble).
+        # IVCD (trapezoidal integration, cell-days/mL)
+        if "vcd" in grp.columns:
+            vcd_time = grp[[TIME_COL, "vcd"]].dropna()
+            if len(vcd_time) >= 2:
+                rec["ivcd"] = float(np.trapezoid(
+                    y=vcd_time["vcd"].values, x=vcd_time[TIME_COL].values
+                )) / 24.0
+            else:
+                rec["ivcd"] = np.nan
+        else:
+            rec["ivcd"] = np.nan
 
-    Shows ensemble mean position with ±1σ error bars.
-    """
-    _setup_style()
-    n_clones = len(clone_names)
+        # mu_max (max specific growth rate from consecutive positive VCD)
+        if "vcd" in grp.columns:
+            vcd_vals = grp[["vcd", TIME_COL]].dropna()
+            vcd_arr = vcd_vals["vcd"].values
+            t_arr = vcd_vals[TIME_COL].values
+            mu_vals = []
+            for i in range(len(vcd_arr) - 1):
+                if vcd_arr[i] > 0 and vcd_arr[i + 1] > 0:
+                    dt = t_arr[i + 1] - t_arr[i]
+                    if dt > 0:
+                        mu_vals.append(np.log(vcd_arr[i + 1] / vcd_arr[i]) / dt)
+            rec["mu_max"] = max(mu_vals) if mu_vals else np.nan
+        else:
+            rec["mu_max"] = np.nan
 
-    # Extract embedding weights from each model: [n_models, n_clones, emb_dim]
-    all_weights = []
-    for net in models:
-        w = net.clone_emb.weight.detach().cpu().numpy()[:n_clones]
-        all_weights.append(w)
-    all_weights = np.stack(all_weights, axis=0)  # [N, n_clones, D]
+        # Volumetric productivity (mg/L/day)
+        total_hours = grp[TIME_COL].max() - grp[TIME_COL].min()
+        if not np.isnan(rec.get("final_titer", np.nan)) and total_hours > 0:
+            rec["vol_prod"] = rec["final_titer"] / (total_hours / 24.0)
+        else:
+            rec["vol_prod"] = np.nan
 
-    mean_w = all_weights.mean(axis=0)  # [n_clones, D]
-    std_w = all_weights.std(axis=0)    # [n_clones, D]
+        # Cumulative glucose feed
+        if "feed_glc" in grp.columns:
+            rec["cum_feed_glc"] = grp["feed_glc"].fillna(0).sum()
+        else:
+            rec["cum_feed_glc"] = np.nan
 
-    # Dimensionality reduction
-    if mean_w.shape[1] > 2:
-        pca = PCA(n_components=2)
-        coords = pca.fit_transform(mean_w)  # [n_clones, 2]
-        # Project std through PCA components for error ellipse approximation
-        std_proj = np.abs(std_w @ pca.components_.T)  # [n_clones, 2]
-        xlabel = f"PC1 ({pca.explained_variance_ratio_[0]:.0%})"
-        ylabel = f"PC2 ({pca.explained_variance_ratio_[1]:.0%})"
-        method_label = "PCA"
-    else:
-        coords = mean_w[:, :2]
-        std_proj = std_w[:, :2]
-        xlabel, ylabel = "Dim 1", "Dim 2"
-        method_label = "Raw"
+        records.append(rec)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    cmap = plt.get_cmap("Set2")
-    for i, name in enumerate(clone_names):
-        color = cmap(i % 8)
-        ax.errorbar(coords[i, 0], coords[i, 1],
-                    xerr=std_proj[i, 0], yerr=std_proj[i, 1],
-                    fmt="o", color=color, markersize=10, capsize=4,
-                    label=name, alpha=0.9)
-        ax.annotate(name, (coords[i, 0], coords[i, 1]),
-                    textcoords="offset points", xytext=(8, 4), fontsize=8)
+    kpi_df = pd.DataFrame(records)
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.set_title(f"Clone Embeddings ({method_label})", fontsize=13, fontweight="bold")
-    ax.legend(fontsize=8, loc="best")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
+    # Drop rows where both peak_vcd and final_titer are NaN (useless experiments)
+    mask = kpi_df["peak_vcd"].isna() & kpi_df["final_titer"].isna()
+    n_dropped = mask.sum()
+    if n_dropped > 0:
+        logger.warning("Dropped %d experiments with no peak_vcd and no final_titer", n_dropped)
+        kpi_df = kpi_df[~mask].reset_index(drop=True)
+
+    logger.info("KPI table: %d experiments, columns=%s", len(kpi_df), list(kpi_df.columns))
+    return kpi_df
 
 
-def plot_transfer_bars(results, save_path, cfg):
-    """
-    1x2 grouped-bar chart for transfer learning: 3 methods × 3 shots.
+# ============================================================
+# Plot 01: Trajectory overlays
+# ============================================================
 
-    Args:
-        results: {method: {n_shot: {"nrmse": float, "r2": float}}}
-        save_path: output PNG path.
-        cfg: configuration dict.
-    """
-    _setup_style()
-    methods = ["retrain", "embedding_only", "head_tuning"]
-    shots = [0, 2, 4]
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    n_methods = len(methods)
-    n_shots = len(shots)
-    group_width = 0.8
-    bar_width = group_width / n_shots
-    group_positions = np.arange(n_methods)
-
-    for metric_key, ax, title in [("nrmse", ax1, "NRMSE ↓"), ("r2", ax2, "R² ↑")]:
-        for si, n_shot in enumerate(shots):
-            vals = []
-            for method in methods:
-                v = results.get(method, {}).get(n_shot, {}).get(metric_key, 0.0)
-                vals.append(v)
-            offset = (si - (n_shots - 1) / 2) * bar_width
-            bars = ax.bar(group_positions + offset, vals, bar_width,
-                          label=f"{n_shot}-shot", color=_SHOT_COLORS[n_shot],
-                          alpha=0.9, edgecolor="white", linewidth=0.5)
-            # Value labels on top
-            for bar, v in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f"{v:.2f}", ha="center", va="bottom", fontsize=7)
-
-        ax.set_xticks(group_positions)
-        ax.set_xticklabels([_METHOD_LABELS[m] for m in methods], fontsize=10)
-        ax.set_title(title, fontsize=12)
-        ax.legend(fontsize=9)
-
-    fig.suptitle("Transfer Learning: Few-Shot Adaptation", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
-
-
-def plot_stepwise_vs_freerun_trajectories(
-    models, data, exp_ids, stats, cfg, device, save_path,
-):
-    """
-    Overlay free-run and stepwise trajectories on the same axes.
-
-    Layout: n_rows × n_cols (rows = experiments, cols = state variables).
-    Blue = free-run, green = stepwise, red = observed.
-    """
-    _setup_style()
-    state_cols = cfg["state_cols"]
-    plot_ids = exp_ids[:min(3, len(exp_ids))]
-    n_rows = len(plot_ids)
-    n_cols = len(state_cols)
-
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(3.5 * n_cols, 3 * n_rows), squeeze=False,
-    )
-
-    for row, eid in enumerate(plot_ids):
-        batch = make_batch([eid], data, device)
-
-        # Free-run
-        fr_mean, fr_std, _, fr_t = solve_ensemble(models, batch, stats, cfg)
-        fr_t_np = fr_t.cpu().numpy()
-        fr_mean_np = fr_mean[0].cpu().numpy()
-        fr_std_np = fr_std[0].cpu().numpy()
-
-        # Stepwise
-        sw_mean, sw_std, _, sw_t, reset_times = solve_ensemble_stepwise(
-            models, batch, stats, cfg,
-        )
-        sw_t_np = sw_t.cpu().numpy()
-        sw_mean_np = sw_mean[0].cpu().numpy()
-        sw_std_np = sw_std[0].cpu().numpy()
-
-        # Observed
-        obs_t = batch.times[0].cpu().numpy()
-        obs_y = batch.states[0].cpu().numpy()
-        obs_m = batch.obs_masks[0].cpu().numpy()
-
-        for col in range(n_cols):
-            ax = axes[row, col]
-
-            # Free-run band
-            ax.fill_between(
-                fr_t_np,
-                fr_mean_np[:, col] - fr_std_np[:, col],
-                fr_mean_np[:, col] + fr_std_np[:, col],
-                alpha=0.2, color="#1f77b4",
-            )
-            ax.plot(
-                fr_t_np, fr_mean_np[:, col],
-                color="#1f77b4", linewidth=1.5, label="Free-run",
-            )
-
-            # Stepwise band
-            ax.fill_between(
-                sw_t_np,
-                sw_mean_np[:, col] - sw_std_np[:, col],
-                sw_mean_np[:, col] + sw_std_np[:, col],
-                alpha=0.2, color="#2ca02c",
-            )
-            ax.plot(
-                sw_t_np, sw_mean_np[:, col],
-                color="#2ca02c", linewidth=1.5, label="Stepwise",
-            )
-
-            # Reset vertical lines
-            for rt in reset_times:
-                ax.axvline(rt, color="gray", linestyle="--", alpha=0.5, linewidth=0.8)
-
-            # Observed scatter
-            valid = obs_m[:, col] > 0.5
-            ax.scatter(
-                obs_t[valid], obs_y[valid, col],
-                color="red", s=20, zorder=5, marker="o",
-                edgecolors="darkred", linewidths=0.5, label="Observed",
-            )
-
-            if row == 0:
-                ax.set_title(state_cols[col], fontsize=10, fontweight="bold")
-            if col == 0:
-                ax.set_ylabel(eid, fontsize=8)
-            ax.tick_params(labelsize=7)
-            if row == 0 and col == n_cols - 1:
-                ax.legend(fontsize=6, loc="upper right")
-
-    fig.suptitle(
-        "Stepwise vs Free-run Trajectories (Ensemble Mean ± 1σ)",
-        fontsize=13, fontweight="bold",
-    )
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
-
-
-def plot_transfer_embeddings(
-    transfer_results, base_clone_names, save_path, cfg,
-):
-    """
-    1×3 PCA scatter of base vs holdout clone embeddings for each adaptation method.
-
-    Extracts clone_emb.weight from the 4-shot adapted models (ensemble mean),
-    fits PCA on base clones, and projects the holdout clone onto the same space.
-    """
-    _setup_style()
-    adapted_models = transfer_results.get("models")
-    if adapted_models is None:
-        logger.warning("No 4-shot models available; skipping transfer embedding plot.")
+def plot_trajectory_overlays(df, output_dir):
+    """2x4 grid of state variable trajectories, colored by clone."""
+    available = [c for c in STATE_COLS if c in df.columns]
+    if not available:
+        logger.warning("No state columns found; skipping trajectory plot.")
         return
 
-    methods = ["retrain", "embedding_only", "head_tuning", "full_head_tuning"]
-    method_labels = {"retrain": "Retrain", "embedding_only": "Embed-Only", "head_tuning": "Head-Tune"}
-    n_base = len(base_clone_names)
+    clone_colors = _get_clone_colors(df[CLONE_COL].unique())
+    n_plots = len(available)
+    n_cols = 4
+    n_rows = (n_plots + n_cols - 1) // n_cols
 
-    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows))
+    axes = np.atleast_2d(axes)
 
-    for ax, method in zip(axes, methods):
-        method_models = adapted_models.get(method)
-        if method_models is None:
-            ax.set_title(method_labels[method] + " (N/A)")
-            continue
+    for idx, col in enumerate(available):
+        ax = axes[idx // n_cols, idx % n_cols]
+        for exp_id, grp in df.groupby(EXP_ID_COL):
+            clone = grp[CLONE_COL].iloc[0]
+            ax.plot(grp[TIME_COL], grp[col], color=clone_colors[clone],
+                    alpha=0.3, linewidth=0.8)
+        ax.set_xlabel("Time (h)")
+        ax.set_ylabel(STATE_LABELS.get(col, col))
+        ax.set_title(col.upper())
 
-        # Extract embeddings: each model has n_base+1 rows (last = holdout)
-        all_weights = []
-        for net in method_models:
-            w = net.clone_emb.weight.detach().cpu().numpy()
-            all_weights.append(w)
-        all_weights = np.stack(all_weights, axis=0)  # [N, n_base+1, D]
+    # Hide unused axes
+    for idx in range(n_plots, n_rows * n_cols):
+        axes[idx // n_cols, idx % n_cols].set_visible(False)
 
-        mean_w = all_weights.mean(axis=0)  # [n_base+1, D]
-        base_w = mean_w[:n_base]           # [n_base, D]
-        holdout_w = mean_w[n_base:n_base + 1]  # [1, D]
-
-        # PCA fit on base, transform all
-        pca = PCA(n_components=2)
-        base_coords = pca.fit_transform(base_w)       # [n_base, 2]
-        holdout_coords = pca.transform(holdout_w)      # [1, 2]
-
-        # Base clones — gray circles
-        ax.scatter(
-            base_coords[:, 0], base_coords[:, 1],
-            c="lightgray", edgecolors="gray", s=60, zorder=3, label="Base clones",
-        )
-        for i, name in enumerate(base_clone_names):
-            ax.annotate(
-                name, (base_coords[i, 0], base_coords[i, 1]),
-                textcoords="offset points", xytext=(5, 3), fontsize=6,
-                color="gray",
-            )
-
-        # Holdout clone — red star
-        ax.scatter(
-            holdout_coords[:, 0], holdout_coords[:, 1],
-            c="red", marker="*", s=200, zorder=5, edgecolors="darkred",
-            linewidths=0.5, label="Holdout",
-        )
-
-        ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.0%})")
-        ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.0%})")
-        ax.set_title(method_labels[method], fontsize=12, fontweight="bold")
-        ax.legend(fontsize=8, loc="best")
-
-    fig.suptitle(
-        "Transfer Embeddings: Base vs Holdout (4-shot)",
-        fontsize=13, fontweight="bold",
-    )
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
-
-
-def plot_predictions(models, data, exp_ids, stats, cfg, device, save_path):
-    """
-    Prediction trajectories for selected experiments (stakeholder view).
-
-    Shows ensemble mean ± 1σ with observed data overlay for all states.
-    """
-    _setup_style()
-    all_states = cfg["state_cols"]
-    state_indices = list(range(len(all_states)))
-    shown_states = list(all_states)
-
-    plot_ids = exp_ids[:min(3, len(exp_ids))]
-    n_rows = len(plot_ids)
-    n_cols = len(shown_states)
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 3 * n_rows),
-                             squeeze=False)
-
-    for row, eid in enumerate(plot_ids):
-        batch = make_batch([eid], data, device)
-        mean_pred, std_pred, _, t_eval = solve_ensemble(models, batch, stats, cfg)
-
-        # Denormalize times and get numpy
-        t_np = t_eval.cpu().numpy()
-        mean_np = mean_pred[0].cpu().numpy()  # [T, n_states]
-        std_np = std_pred[0].cpu().numpy()
-
-        obs_t = batch.times[0].cpu().numpy()
-        obs_y = batch.states[0].cpu().numpy()
-        obs_m = batch.obs_masks[0].cpu().numpy()
-
-        for col, si in enumerate(state_indices):
-            ax = axes[row, col]
-            # Prediction band
-            ax.fill_between(t_np, mean_np[:, si] - std_np[:, si],
-                            mean_np[:, si] + std_np[:, si],
-                            alpha=0.25, color="#1f77b4")
-            ax.plot(t_np, mean_np[:, si], color="#1f77b4", linewidth=1.5,
-                    label="Prediction")
-            # Observed data
-            valid = obs_m[:, si] > 0.5
-            ax.scatter(obs_t[valid], obs_y[valid, si], color="red", s=20,
-                       zorder=5, label="Observed", marker="o", edgecolors="darkred",
-                       linewidths=0.5)
-            if row == 0:
-                ax.set_title(shown_states[col], fontsize=10, fontweight="bold")
-            if col == 0:
-                ax.set_ylabel(eid, fontsize=8)
-            ax.tick_params(labelsize=7)
-            if row == 0 and col == n_cols - 1:
-                ax.legend(fontsize=7, loc="upper right")
-
-    fig.suptitle("Prediction Examples (Ensemble Mean ± 1σ)", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=cfg["dpi"], bbox_inches="tight")
-    plt.close(fig)
-    logger.info("Saved %s", save_path)
+    # Legend
+    handles = [mpatches.Patch(color=c, label=n) for n, c in clone_colors.items()]
+    fig.legend(handles=handles, loc="lower right", fontsize=9, ncol=min(len(handles), 5))
+    fig.tight_layout(rect=[0, 0.03, 1, 1])
+    save_figure(fig, os.path.join(output_dir, "01_trajectory_overlays.png"))
 
 
 # ============================================================
-# S8: Main Pipeline
+# Plot 02a/02b: KPI correlation
 # ============================================================
 
-def main(args):
-    """
-    Full nano_biopfm pipeline: data → train → evaluate → transfer → visualize.
+def plot_kpi_correlation(kpi_df, output_dir):
+    """Correlation heatmap (02a) and pairplot (02b) of KPIs."""
+    numeric_cols = [c for c in ["peak_vcd", "final_titer", "ivcd", "max_lac",
+                                "mu_max", "vol_prod", "cum_feed_glc"]
+                    if c in kpi_df.columns]
+    if len(numeric_cols) < 2:
+        logger.warning("Not enough KPI columns for correlation; skipping.")
+        return
 
-    Phases:
-        1. Data loading and splitting
-        2. Base ensemble training
-        3. Base model evaluation (train vs test)
-        4. Free-run vs stepwise comparison
-        5. Clone embedding visualization
-        6. Transfer learning (3 methods × 3 shots)
-        7. Prediction examples
-    """
-    device = get_device(args.device)
-    out_dir = args.output
-    os.makedirs(out_dir, exist_ok=True)
-    logger.info("Device: %s | Output: %s", device, out_dir)
+    kpi_numeric = kpi_df[numeric_cols].dropna(axis=1, how="all")
 
-    # ========== Phase 1: Data ==========
-    logger.info("=" * 60)
-    logger.info("Phase 1: Loading data")
-    data, vocab = load_and_preprocess(args.data, CFG)
-    logger.info("Loaded %d experiments, %d clones: %s",
-                len(data), vocab["n_clones"], vocab["clone_names"])
+    # 02a: Heatmap
+    corr = kpi_numeric.corr()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", center=0,
+                vmin=-1, vmax=1, square=True, ax=ax, linewidths=0.5)
+    ax.set_title("KPI Correlation Matrix")
+    save_figure(fig, os.path.join(output_dir, "02a_kpi_correlation_heatmap.png"))
 
-    base_data, holdout_data = split_holdout(data, args.holdout_clone, CFG)
-    train_ids, val_ids = split_train_val(base_data, CFG["val_ratio"], CFG["seed"])
-    stats = compute_stats(base_data, train_ids, CFG)
-
-    # Two-way split only: val_ids used for both early stopping and evaluation
-    eval_ids = val_ids
-    logger.info("Splits — train: %d, val/eval: %d, holdout: %d",
-                len(train_ids), len(eval_ids), len(holdout_data))
-
-    # ========== Phase 2: Train Base Ensemble ==========
-    logger.info("=" * 60)
-    logger.info("Phase 2: Training base ensemble (%d models)", CFG["n_ensemble"])
-    models, histories = train_ensemble(
-        base_data, train_ids, val_ids, stats, vocab["n_clones"], CFG, device,
-    )
-    plot_training_metrics(histories, os.path.join(out_dir, "training_metrics.png"), CFG)
-
-    # ========== Phase 3: Evaluate Base Model ==========
-    logger.info("=" * 60)
-    logger.info("Phase 3: Evaluating base model")
-    train_metrics = evaluate_ensemble(models, base_data, train_ids, stats, CFG, device)
-    eval_metrics = evaluate_ensemble(models, base_data, eval_ids, stats, CFG, device)
-    logger.info("Train — NRMSE: %.4f  R²: %.4f", train_metrics["avg_nrmse"], train_metrics["avg_r2"])
-    logger.info("Val   — NRMSE: %.4f  R²: %.4f", eval_metrics["avg_nrmse"], eval_metrics["avg_r2"])
-    plot_metrics_comparison(
-        train_metrics, eval_metrics, CFG["state_cols"],
-        os.path.join(out_dir, "metrics_comparison.png"), CFG,
-    )
-
-    # ========== Phase 4: Free-run vs Stepwise ==========
-    logger.info("=" * 60)
-    logger.info("Phase 4: Free-run vs Stepwise comparison")
-    sw_metrics = evaluate_stepwise(models, base_data, eval_ids, stats, CFG, device)
-    logger.info("Stepwise — NRMSE: %.4f  R²: %.4f  Resets: %.1f",
-                sw_metrics["avg_nrmse"], sw_metrics["avg_r2"], sw_metrics.get("avg_n_resets", 0))
-    plot_freerun_vs_stepwise(
-        eval_metrics, sw_metrics, CFG["state_cols"],
-        os.path.join(out_dir, "freerun_vs_stepwise.png"), CFG,
-    )
-
-    # ========== Phase 4.5: Stepwise vs Free-run Trajectories ==========
-    logger.info("=" * 60)
-    logger.info("Phase 4.5: Stepwise vs Free-run trajectory overlay")
-    plot_stepwise_vs_freerun_trajectories(
-        models, base_data, eval_ids, stats, CFG, device,
-        os.path.join(out_dir, "stepwise_trajectories.png"),
-    )
-
-    # ========== Phase 5: Embedding Visualization ==========
-    logger.info("=" * 60)
-    logger.info("Phase 5: Embedding visualization")
-    # Only visualize base clones (exclude holdout which isn't in vocabulary)
-    base_clone_names = [c for c in vocab["clone_names"] if c != args.holdout_clone]
-    plot_embeddings(models, base_clone_names, os.path.join(out_dir, "embeddings.png"), CFG)
-
-    # ========== Phase 6: Transfer Learning ==========
-    logger.info("=" * 60)
-    logger.info("Phase 6: Transfer learning experiment")
-    transfer_results = run_transfer_experiment(
-        models, base_data, holdout_data, args.holdout_clone,
-        train_ids, val_ids, stats, vocab, CFG, device,
-    )
-    plot_transfer_bars(transfer_results, os.path.join(out_dir, "transfer_learning.png"), CFG)
-
-    # ========== Phase 6.5: Transfer Embedding Visualization ==========
-    logger.info("=" * 60)
-    logger.info("Phase 6.5: Transfer embedding comparison")
-    plot_transfer_embeddings(
-        transfer_results, base_clone_names,
-        os.path.join(out_dir, "transfer_embeddings.png"), CFG,
-    )
-
-    # ========== Phase 7: Prediction Examples ==========
-    logger.info("=" * 60)
-    logger.info("Phase 7: Prediction examples")
-    plot_predictions(
-        models, base_data, eval_ids[:3], stats, CFG, device,
-        os.path.join(out_dir, "prediction_examples.png"),
-    )
-
-    # ========== Summary ==========
-    logger.info("=" * 60)
-    logger.info("All results saved to: %s", out_dir)
-    logger.info("  training_metrics.png       — loss and NRMSE curves")
-    logger.info("  metrics_comparison.png     — train vs val metrics (4 metrics)")
-    logger.info("  freerun_vs_stepwise.png    — free-run vs stepwise comparison")
-    logger.info("  stepwise_trajectories.png  — stepwise vs free-run overlay")
-    logger.info("  embeddings.png             — clone embedding PCA")
-    logger.info("  transfer_learning.png      — few-shot adaptation (3×3)")
-    logger.info("  transfer_embeddings.png    — transfer embedding comparison")
-    logger.info("  prediction_examples.png    — example trajectories")
-    logger.info("Done!")
+    # 02b: Pairplot
+    pair_cols = [c for c in ["peak_vcd", "final_titer", "ivcd", "mu_max"]
+                 if c in kpi_df.columns]
+    if len(pair_cols) >= 2 and CLONE_COL in kpi_df.columns:
+        pair_df = kpi_df[pair_cols + [CLONE_COL]].dropna(subset=pair_cols)
+        g = sns.pairplot(pair_df, hue=CLONE_COL, diag_kind="kde",
+                         plot_kws={"alpha": 0.6, "s": 30})
+        g.figure.suptitle("KPI Pairplot by Clone", y=1.02)
+        save_figure(g.figure, os.path.join(output_dir, "02b_kpi_pairplot.png"))
 
 
 # ============================================================
-# S9: CLI Entry Point
+# Plot 03a/03b: Clone comparison
 # ============================================================
 
-if __name__ == "__main__":
+def plot_clone_comparison(kpi_df, output_dir):
+    """Violin plots (03a) and radar chart (03b) for clone KPI comparison."""
+    # 03a: Violin plots
+    violin_cols = [c for c in ["final_titer", "peak_vcd", "ivcd", "max_lac"]
+                   if c in kpi_df.columns]
+    violin_labels = {
+        "final_titer": "Final Titer (mg/L)", "peak_vcd": "Peak VCD (10⁶/mL)",
+        "ivcd": "IVCD (10⁶ cell·day/mL)", "max_lac": "Max Lactate (mM)",
+    }
+    if violin_cols and CLONE_COL in kpi_df.columns:
+        n = len(violin_cols)
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
+        if n == 1:
+            axes = [axes]
+        for ax, col in zip(axes, violin_cols):
+            plot_df = kpi_df[[CLONE_COL, col]].dropna()
+            sns.violinplot(data=plot_df, x=CLONE_COL, y=col, hue=CLONE_COL,
+                           inner="box", palette="tab10", legend=False, ax=ax)
+            ax.set_ylabel(violin_labels.get(col, col))
+            ax.set_xlabel("")
+            ax.set_title(col.replace("_", " ").title())
+        fig.suptitle("Clone KPI Comparison", fontsize=13, y=1.02)
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "03a_clone_boxplots.png"))
+
+    # 03b: Radar chart
+    radar_cols = [c for c in ["peak_vcd", "final_titer", "ivcd", "max_lac", "mu_max", "vol_prod"]
+                  if c in kpi_df.columns]
+    if len(radar_cols) < 3 or CLONE_COL not in kpi_df.columns:
+        logger.warning("Not enough KPI columns for radar chart; skipping.")
+        return
+
+    # Compute clone medians and normalize
+    clone_medians = kpi_df.groupby(CLONE_COL)[radar_cols].median()
+    scaler = MinMaxScaler()
+    normalized = pd.DataFrame(
+        scaler.fit_transform(clone_medians),
+        index=clone_medians.index, columns=clone_medians.columns,
+    )
+
+    # Plot
+    n_vars = len(radar_cols)
+    angles = np.linspace(0, 2 * np.pi, n_vars, endpoint=False).tolist()
+    angles += angles[:1]  # close polygon
+
+    clone_colors = _get_clone_colors(normalized.index)
+    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw={"polar": True})
+
+    for clone_name in normalized.index:
+        values = normalized.loc[clone_name].values.tolist()
+        values += values[:1]
+        ax.plot(angles, values, "o-", linewidth=1.5, label=clone_name,
+                color=clone_colors[clone_name], markersize=4)
+        ax.fill(angles, values, alpha=0.1, color=clone_colors[clone_name])
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels([c.replace("_", " ").title() for c in radar_cols], fontsize=9)
+    ax.set_ylim(0, 1.1)
+    ax.set_title("Clone Radar — Normalized Medians", fontsize=12, pad=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+    save_figure(fig, os.path.join(output_dir, "03b_clone_radar.png"))
+
+
+# ============================================================
+# Plot 04a/04b/04c: Feeding strategy
+# ============================================================
+
+def plot_feeding_strategy(df, kpi_df, output_dir):
+    """Cumulative feeds (04a), process param KDE (04b), feed vs titer scatter (04c)."""
+    available_feeds = [c for c in FEED_COLS if c in df.columns]
+    clone_colors = _get_clone_colors(df[CLONE_COL].unique())
+
+    # 04a: Cumulative feed curves
+    if available_feeds:
+        n_feeds = len(available_feeds)
+        fig, axes = plt.subplots(1, n_feeds, figsize=(5 * n_feeds, 4))
+        if n_feeds == 1:
+            axes = [axes]
+        for ax, fcol in zip(axes, available_feeds):
+            for exp_id, grp in df.groupby(EXP_ID_COL):
+                clone = grp[CLONE_COL].iloc[0]
+                cumfeed = grp[fcol].fillna(0).cumsum()
+                ax.plot(grp[TIME_COL].values, cumfeed.values,
+                        color=clone_colors[clone], alpha=0.3, linewidth=0.8)
+            ax.set_xlabel("Time (h)")
+            ax.set_ylabel(FEED_LABELS.get(fcol, fcol))
+            ax.set_title(f"Cumulative {fcol}")
+        handles = [mpatches.Patch(color=c, label=n) for n, c in clone_colors.items()]
+        fig.legend(handles=handles, loc="lower right", fontsize=8,
+                   ncol=min(len(handles), 5))
+        fig.tight_layout(rect=[0, 0.03, 1, 1])
+        save_figure(fig, os.path.join(output_dir, "04a_cumulative_feeds.png"))
+
+    # 04b: Temperature / pH KDE
+    available_controls = [c for c in ["temperature", "pH"] if c in df.columns]
+    if available_controls and CLONE_COL in df.columns:
+        n_ctrl = len(available_controls)
+        fig, axes = plt.subplots(1, n_ctrl, figsize=(5 * n_ctrl, 4))
+        if n_ctrl == 1:
+            axes = [axes]
+        for ax, ccol in zip(axes, available_controls):
+            plot_df = df[[CLONE_COL, ccol]].dropna()
+            sns.kdeplot(data=plot_df, x=ccol, hue=CLONE_COL, ax=ax,
+                        palette="tab10", fill=True, alpha=0.3)
+            ax.set_title(f"{ccol} Distribution")
+        fig.tight_layout()
+        save_figure(fig, os.path.join(output_dir, "04b_process_params.png"))
+
+    # 04c: Cumulative feed vs titer scatter
+    if ("cum_feed_glc" in kpi_df.columns and "final_titer" in kpi_df.columns
+            and CLONE_COL in kpi_df.columns):
+        plot_df = kpi_df[["cum_feed_glc", "final_titer", CLONE_COL]].dropna()
+        if len(plot_df) >= 3:
+            fig, ax = plt.subplots(figsize=(6, 5))
+            sns.scatterplot(data=plot_df, x="cum_feed_glc", y="final_titer",
+                            hue=CLONE_COL, palette="tab10", s=50, alpha=0.7, ax=ax)
+            # Linear regression line + R²
+            x = plot_df["cum_feed_glc"].values
+            y = plot_df["final_titer"].values
+            mask_valid = np.isfinite(x) & np.isfinite(y)
+            if mask_valid.sum() >= 2:
+                coeffs = np.polyfit(x[mask_valid], y[mask_valid], 1)
+                x_line = np.linspace(x[mask_valid].min(), x[mask_valid].max(), 100)
+                ax.plot(x_line, np.polyval(coeffs, x_line), "k--", alpha=0.5, linewidth=1)
+                ss_res = np.sum((y[mask_valid] - np.polyval(coeffs, x[mask_valid])) ** 2)
+                ss_tot = np.sum((y[mask_valid] - y[mask_valid].mean()) ** 2)
+                r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+                ax.annotate(f"R² = {r2:.3f}", xy=(0.05, 0.95), xycoords="axes fraction",
+                            fontsize=10, ha="left", va="top",
+                            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+            ax.set_xlabel("Cumulative Glucose Feed")
+            ax.set_ylabel("Final Titer (mg/L)")
+            ax.set_title("Cumulative Feed vs Final Titer")
+            save_figure(fig, os.path.join(output_dir, "04c_feed_vs_titer.png"))
+
+
+# ============================================================
+# Plot 05: PCA + KMeans clustering
+# ============================================================
+
+def plot_pca_clustering(df, n_clusters=5, n_timepoints=10, output_dir="eda_results"):
+    """PCA on batch-unfolded state trajectories with KMeans clustering."""
+    available_states = [c for c in STATE_COLS if c in df.columns]
+    if len(available_states) < 2:
+        logger.warning("Not enough state columns for PCA; skipping.")
+        return
+
+    unique_ids = df[EXP_ID_COL].unique()
+    clone_map = {}  # exp_id → clone_name
+    unfolded = []
+    valid_ids = []
+
+    for uid in unique_ids:
+        grp = df[df[EXP_ID_COL] == uid].sort_values(TIME_COL)
+        clone_map[uid] = grp[CLONE_COL].iloc[0]
+
+        state_vals = grp[available_states].copy()
+        # Interpolate NaN within each experiment
+        state_vals = state_vals.interpolate(method="linear", limit_direction="both")
+        state_vals = state_vals.fillna(0)
+        arr = state_vals.values
+
+        # Resample to fixed length
+        seq_len = len(arr)
+        if seq_len >= n_timepoints:
+            indices = np.linspace(0, seq_len - 1, n_timepoints, dtype=int)
+            resampled = arr[indices]
+        else:
+            padding = np.tile(arr[-1:], (n_timepoints - seq_len, 1))
+            resampled = np.vstack([arr, padding])
+
+        features = resampled.flatten()
+        if np.isfinite(features).all():
+            unfolded.append(features)
+            valid_ids.append(uid)
+        else:
+            logger.warning("Skipping experiment %s: contains NaN/Inf after interpolation", uid)
+
+    if len(unfolded) < n_clusters:
+        logger.warning("Only %d valid experiments (< %d clusters); skipping PCA.",
+                       len(unfolded), n_clusters)
+        return
+
+    X = np.array(unfolded)
+    X_scaled = StandardScaler().fit_transform(X)
+
+    pca = PCA(n_components=2)
+    X_pca = pca.fit_transform(X_scaled)
+
+    actual_k = min(n_clusters, len(X_pca))
+    labels = KMeans(n_clusters=actual_k, random_state=42, n_init=10).fit_predict(X_pca)
+
+    # Clone markers
+    clone_names = sorted(set(clone_map[uid] for uid in valid_ids))
+    markers = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p"]
+    clone_marker = {c: markers[i % len(markers)] for i, c in enumerate(clone_names)}
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cmap = plt.get_cmap("Set2", actual_k)
+
+    for i, uid in enumerate(valid_ids):
+        clone = clone_map[uid]
+        ax.scatter(X_pca[i, 0], X_pca[i, 1],
+                   c=[cmap(labels[i])], marker=clone_marker[clone],
+                   s=60, alpha=0.7, edgecolors="k", linewidths=0.3)
+
+    # Legends
+    cluster_handles = [mpatches.Patch(color=cmap(k), label=f"Cluster {k}")
+                       for k in range(actual_k)]
+    clone_handles = [plt.Line2D([0], [0], marker=clone_marker[c], color="gray",
+                                linestyle="None", markersize=7, label=c)
+                     for c in clone_names]
+    leg1 = ax.legend(handles=cluster_handles, loc="upper left", title="Cluster", fontsize=8)
+    ax.add_artist(leg1)
+    ax.legend(handles=clone_handles, loc="upper right", title="Clone", fontsize=8)
+
+    ev = pca.explained_variance_ratio_
+    ax.set_xlabel(f"PC1 ({ev[0]:.1%} variance)")
+    ax.set_ylabel(f"PC2 ({ev[1]:.1%} variance)")
+    ax.set_title(f"PCA + KMeans (k={actual_k}) on Batch-Unfolded States")
+    save_figure(fig, os.path.join(output_dir, "05_pca_clustering.png"))
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="BioPFM EDA Report Generator")
+    parser.add_argument("--data", required=True, help="Path to CSV dataset")
+    parser.add_argument("--output", default="eda_results", help="Output directory")
+    parser.add_argument("--n-clusters", type=int, default=5, help="KMeans clusters for PCA")
+    parser.add_argument("--dpi", type=int, default=150, help="Figure DPI")
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
     )
-    parser = argparse.ArgumentParser(
-        description="nano_biopfm: Neural ODE for bioprocess modeling",
-    )
-    parser.add_argument("--data", required=True, help="Path to CSV dataset")
-    parser.add_argument("--holdout-clone", required=True, help="Clone name to hold out")
-    parser.add_argument("--output", default="nano_results", help="Output directory")
-    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--n-ensemble", type=int, default=None)
-    args = parser.parse_args()
-    if args.epochs:
-        CFG["epochs"] = args.epochs
-    if args.n_ensemble:
-        CFG["n_ensemble"] = args.n_ensemble
-    main(args)
+
+    setup_style()
+    os.makedirs(args.output, exist_ok=True)
+
+    df = load_data(args.data)
+    kpi_df = compute_experiment_kpis(df)
+
+    logger.info("=== Generating plots ===")
+    plot_trajectory_overlays(df, args.output)
+    plot_kpi_correlation(kpi_df, args.output)
+    plot_clone_comparison(kpi_df, args.output)
+    plot_feeding_strategy(df, kpi_df, args.output)
+    plot_pca_clustering(df, n_clusters=args.n_clusters, output_dir=args.output)
+
+    logger.info("=== EDA report complete → %s/ ===", args.output)
+
+
+if __name__ == "__main__":
+    main()
