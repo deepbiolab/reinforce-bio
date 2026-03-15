@@ -51,6 +51,11 @@ FEED_LABELS = {
     "feed_glc": "Glucose Feed (L)", "feed_7a": "Feed 7a (L)", "feed_7b": "Feed 7b (L)",
 }
 
+# Extended marker list for PCA / scatter (16 distinct shapes)
+MARKER_LIST = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p", "d", ">", "<", "H", "8", "+"]
+# Linestyle cycle for trajectory differentiation
+LINESTYLE_LIST = ["-", "--", "-.", ":"]
+
 
 # ============================================================
 # Style & utilities
@@ -70,10 +75,38 @@ def setup_style():
 
 
 def _get_clone_colors(clone_names):
-    """Return a dict mapping clone_name → color from tab10/tab20."""
-    n = len(clone_names)
-    cmap = plt.get_cmap("tab10" if n <= 10 else "tab20")
-    return {name: cmap(i % cmap.N) for i, name in enumerate(sorted(clone_names))}
+    """Return a dict mapping clone_name -> color with good separation.
+
+    <=10 clones: tab10, 11-20: tab20, >20: nipy_spectral (evenly sampled,
+    avoiding dark edges).
+    """
+    names = sorted(clone_names)
+    n = len(names)
+    if n <= 10:
+        cmap = plt.get_cmap("tab10")
+        return {name: cmap(i) for i, name in enumerate(names)}
+    if n <= 20:
+        cmap = plt.get_cmap("tab20")
+        return {name: cmap(i) for i, name in enumerate(names)}
+    # >20: sample nipy_spectral avoiding dark edges (0.05 .. 0.95)
+    cmap = plt.get_cmap("nipy_spectral")
+    positions = np.linspace(0.05, 0.95, n)
+    return {name: cmap(pos) for name, pos in zip(names, positions)}
+
+
+def _get_clone_linestyles(clone_names):
+    """Return a dict mapping clone_name -> linestyle (cycling)."""
+    names = sorted(clone_names)
+    return {name: LINESTYLE_LIST[i % len(LINESTYLE_LIST)] for i, name in enumerate(names)}
+
+
+def _adaptive_ncol(n_items, max_ncol=8):
+    """Choose ncol for legend based on item count."""
+    if n_items <= 5:
+        return n_items
+    if n_items <= 10:
+        return 5
+    return min(max_ncol, (n_items + 1) // 2)
 
 
 def save_figure(fig, path, dpi=150):
@@ -206,17 +239,46 @@ def compute_experiment_kpis(df):
 
 
 # ============================================================
+# Plot 00: Clone run counts (NEW)
+# ============================================================
+
+def plot_clone_run_counts(df, output_dir):
+    """Bar chart of experiment count per clone, sorted descending."""
+    counts = df.groupby(CLONE_COL)[EXP_ID_COL].nunique().sort_values(ascending=False)
+    clone_colors = _get_clone_colors(counts.index)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(counts) * 0.5), 4))
+    bars = ax.bar(range(len(counts)), counts.values,
+                  color=[clone_colors[c] for c in counts.index])
+
+    # Annotate counts on bars
+    for bar, val in zip(bars, counts.values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.3,
+                str(val), ha="center", va="bottom", fontsize=9, fontweight="bold")
+
+    ax.set_xticks(range(len(counts)))
+    ax.set_xticklabels(counts.index, rotation=45, ha="right", fontsize=9)
+    ax.set_xlabel("Clone")
+    ax.set_ylabel("Number of Experiments")
+    ax.set_title("Experiment Count per Clone")
+    fig.tight_layout()
+    save_figure(fig, os.path.join(output_dir, "00_clone_run_counts.png"))
+
+
+# ============================================================
 # Plot 01: Trajectory overlays
 # ============================================================
 
 def plot_trajectory_overlays(df, output_dir):
-    """2x4 grid of state variable trajectories, colored by clone."""
+    """2xN grid of state variable trajectories, colored by clone."""
     available = [c for c in STATE_COLS if c in df.columns]
     if not available:
         logger.warning("No state columns found; skipping trajectory plot.")
         return
 
-    clone_colors = _get_clone_colors(df[CLONE_COL].unique())
+    clone_names = df[CLONE_COL].unique()
+    clone_colors = _get_clone_colors(clone_names)
+    clone_ls = _get_clone_linestyles(clone_names)
     n_plots = len(available)
     n_cols = 4
     n_rows = (n_plots + n_cols - 1) // n_cols
@@ -229,7 +291,7 @@ def plot_trajectory_overlays(df, output_dir):
         for exp_id, grp in df.groupby(EXP_ID_COL):
             clone = grp[CLONE_COL].iloc[0]
             ax.plot(grp[TIME_COL], grp[col], color=clone_colors[clone],
-                    alpha=0.3, linewidth=0.8)
+                    alpha=0.3, linewidth=1.0, linestyle=clone_ls[clone])
         ax.set_xlabel("Time (h)")
         ax.set_ylabel(STATE_LABELS.get(col, col))
         ax.set_title(col.upper())
@@ -238,19 +300,21 @@ def plot_trajectory_overlays(df, output_dir):
     for idx in range(n_plots, n_rows * n_cols):
         axes[idx // n_cols, idx % n_cols].set_visible(False)
 
-    # Legend
-    handles = [mpatches.Patch(color=c, label=n) for n, c in clone_colors.items()]
-    fig.legend(handles=handles, loc="lower right", fontsize=9, ncol=min(len(handles), 5))
-    fig.tight_layout(rect=[0, 0.03, 1, 1])
+    # Legend at figure bottom outside
+    handles = [mpatches.Patch(color=clone_colors[n], label=n) for n in sorted(clone_names)]
+    ncol = _adaptive_ncol(len(handles))
+    fig.legend(handles=handles, loc="lower center", fontsize=8, ncol=ncol,
+               bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
     save_figure(fig, os.path.join(output_dir, "01_trajectory_overlays.png"))
 
 
 # ============================================================
-# Plot 02a/02b: KPI correlation
+# Plot 02a: KPI correlation heatmap
 # ============================================================
 
 def plot_kpi_correlation(kpi_df, output_dir):
-    """Correlation heatmap (02a) and pairplot (02b) of KPIs."""
+    """Correlation heatmap (02a) of KPIs."""
     numeric_cols = [c for c in ["peak_vcd", "final_titer", "ivcd", "max_lac",
                                 "mu_max", "vol_prod", "cum_feed_glc"]
                     if c in kpi_df.columns]
@@ -260,7 +324,6 @@ def plot_kpi_correlation(kpi_df, output_dir):
 
     kpi_numeric = kpi_df[numeric_cols].dropna(axis=1, how="all")
 
-    # 02a: Heatmap
     corr = kpi_numeric.corr()
     fig, ax = plt.subplots(figsize=(8, 6))
     sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", center=0,
@@ -268,15 +331,25 @@ def plot_kpi_correlation(kpi_df, output_dir):
     ax.set_title("KPI Correlation Matrix")
     save_figure(fig, os.path.join(output_dir, "02a_kpi_correlation_heatmap.png"))
 
-    # 02b: Pairplot
-    pair_cols = [c for c in ["peak_vcd", "final_titer", "ivcd", "mu_max"]
-                 if c in kpi_df.columns]
-    if len(pair_cols) >= 2 and CLONE_COL in kpi_df.columns:
-        pair_df = kpi_df[pair_cols + [CLONE_COL]].dropna(subset=pair_cols)
-        g = sns.pairplot(pair_df, hue=CLONE_COL, diag_kind="kde",
-                         plot_kws={"alpha": 0.6, "s": 30})
-        g.figure.suptitle("KPI Pairplot by Clone", y=1.02)
-        save_figure(g.figure, os.path.join(output_dir, "02b_kpi_pairplot.png"))
+
+# ============================================================
+# Plot 02c: Raw data correlation heatmap (NEW)
+# ============================================================
+
+def plot_raw_correlation(df, output_dir):
+    """Correlation heatmap of all numeric process columns (states + controls + feeds)."""
+    candidate_cols = STATE_COLS + CONTROL_COLS + FEED_COLS
+    available = [c for c in candidate_cols if c in df.columns]
+    if len(available) < 2:
+        logger.warning("Not enough numeric columns for raw correlation; skipping.")
+        return
+
+    corr = df[available].corr()
+    fig, ax = plt.subplots(figsize=(max(8, len(available) * 0.7), max(6, len(available) * 0.55)))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", center=0,
+                vmin=-1, vmax=1, square=True, ax=ax, linewidths=0.5)
+    ax.set_title("Raw Data Correlation Matrix (All Numeric Columns)")
+    save_figure(fig, os.path.join(output_dir, "02c_raw_correlation_heatmap.png"))
 
 
 # ============================================================
@@ -284,8 +357,8 @@ def plot_kpi_correlation(kpi_df, output_dir):
 # ============================================================
 
 def plot_clone_comparison(kpi_df, output_dir):
-    """Violin plots (03a) and radar chart (03b) for clone KPI comparison."""
-    # 03a: Violin plots
+    """Box/violin plots (03a) and radar chart (03b) for clone KPI comparison."""
+    # 03a: Clone KPI comparison
     violin_cols = [c for c in ["final_titer", "peak_vcd", "ivcd", "max_lac"]
                    if c in kpi_df.columns]
     violin_labels = {
@@ -293,17 +366,40 @@ def plot_clone_comparison(kpi_df, output_dir):
         "ivcd": "IVCD (10⁶ cell·day/mL)", "max_lac": "Max Lactate (mM)",
     }
     if violin_cols and CLONE_COL in kpi_df.columns:
-        n = len(violin_cols)
-        fig, axes = plt.subplots(1, n, figsize=(4 * n, 4))
-        if n == 1:
-            axes = [axes]
-        for ax, col in zip(axes, violin_cols):
-            plot_df = kpi_df[[CLONE_COL, col]].dropna()
-            sns.violinplot(data=plot_df, x=CLONE_COL, y=col, hue=CLONE_COL,
-                           inner="box", palette="tab10", legend=False, ax=ax)
-            ax.set_ylabel(violin_labels.get(col, col))
-            ax.set_xlabel("")
-            ax.set_title(col.replace("_", " ").title())
+        n_clones = kpi_df[CLONE_COL].nunique()
+        n_kpis = len(violin_cols)
+
+        if n_clones > 10:
+            # Horizontal boxplots — height scales with clone count
+            fig_h = max(4, n_clones * 0.4)
+            fig, axes = plt.subplots(1, n_kpis, figsize=(5 * n_kpis, fig_h))
+            if n_kpis == 1:
+                axes = [axes]
+            clone_order = sorted(kpi_df[CLONE_COL].unique())
+            for ax, col in zip(axes, violin_cols):
+                plot_df = kpi_df[[CLONE_COL, col]].dropna()
+                sns.boxplot(data=plot_df, y=CLONE_COL, x=col, order=clone_order,
+                            hue=CLONE_COL, palette=_get_clone_colors(clone_order),
+                            legend=False, ax=ax)
+                ax.set_xlabel(violin_labels.get(col, col))
+                ax.set_ylabel("")
+                ax.set_title(col.replace("_", " ").title())
+        else:
+            # Vertical violins for <=10 clones
+            fig, axes = plt.subplots(1, n_kpis, figsize=(4 * n_kpis, 4))
+            if n_kpis == 1:
+                axes = [axes]
+            for ax, col in zip(axes, violin_cols):
+                plot_df = kpi_df[[CLONE_COL, col]].dropna()
+                sns.violinplot(data=plot_df, x=CLONE_COL, y=col, hue=CLONE_COL,
+                               inner="box", palette="tab10", legend=False, ax=ax)
+                ax.set_ylabel(violin_labels.get(col, col))
+                ax.set_xlabel("")
+                ax.set_title(col.replace("_", " ").title())
+                ax.tick_params(axis="x", rotation=45)
+                for label in ax.get_xticklabels():
+                    label.set_ha("right")
+
         fig.suptitle("Clone KPI Comparison", fontsize=13, y=1.02)
         fig.tight_layout()
         save_figure(fig, os.path.join(output_dir, "03a_clone_boxplots.png"))
@@ -317,6 +413,15 @@ def plot_clone_comparison(kpi_df, output_dir):
 
     # Compute clone medians and normalize
     clone_medians = kpi_df.groupby(CLONE_COL)[radar_cols].median()
+
+    # Truncate to top-8 by final_titer median if too many clones
+    title_suffix = ""
+    if len(clone_medians) > 8:
+        sort_col = "final_titer" if "final_titer" in radar_cols else radar_cols[0]
+        top_clones = clone_medians[sort_col].nlargest(8).index
+        clone_medians = clone_medians.loc[top_clones]
+        title_suffix = f" (Top 8 by {sort_col})"
+
     scaler = MinMaxScaler()
     normalized = pd.DataFrame(
         scaler.fit_transform(clone_medians),
@@ -341,8 +446,14 @@ def plot_clone_comparison(kpi_df, output_dir):
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels([c.replace("_", " ").title() for c in radar_cols], fontsize=9)
     ax.set_ylim(0, 1.1)
-    ax.set_title("Clone Radar — Normalized Medians", fontsize=12, pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=9)
+    ax.set_title(f"Clone Radar — Normalized Medians{title_suffix}", fontsize=12, pad=20)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.15, 1.1), fontsize=9)
+
+    # Explanatory annotation
+    fig.text(0.5, -0.02,
+             "Each axis shows MinMax-normalized clone median (0-1). "
+             "Further from center = better performance.",
+             ha="center", fontsize=9, style="italic", color="gray")
     save_figure(fig, os.path.join(output_dir, "03b_clone_radar.png"))
 
 
@@ -353,7 +464,9 @@ def plot_clone_comparison(kpi_df, output_dir):
 def plot_feeding_strategy(df, kpi_df, output_dir):
     """Cumulative feeds (04a), process param KDE (04b), feed vs titer scatter (04c)."""
     available_feeds = [c for c in FEED_COLS if c in df.columns]
-    clone_colors = _get_clone_colors(df[CLONE_COL].unique())
+    clone_names = df[CLONE_COL].unique()
+    clone_colors = _get_clone_colors(clone_names)
+    clone_ls = _get_clone_linestyles(clone_names)
 
     # 04a: Cumulative feed curves
     if available_feeds:
@@ -366,28 +479,32 @@ def plot_feeding_strategy(df, kpi_df, output_dir):
                 clone = grp[CLONE_COL].iloc[0]
                 cumfeed = grp[fcol].fillna(0).cumsum()
                 ax.plot(grp[TIME_COL].values, cumfeed.values,
-                        color=clone_colors[clone], alpha=0.3, linewidth=0.8)
+                        color=clone_colors[clone], alpha=0.3, linewidth=1.0,
+                        linestyle=clone_ls[clone])
             ax.set_xlabel("Time (h)")
             ax.set_ylabel(FEED_LABELS.get(fcol, fcol))
             ax.set_title(f"Cumulative {fcol}")
-        handles = [mpatches.Patch(color=c, label=n) for n, c in clone_colors.items()]
-        fig.legend(handles=handles, loc="lower right", fontsize=8,
-                   ncol=min(len(handles), 5))
-        fig.tight_layout(rect=[0, 0.03, 1, 1])
+
+        handles = [mpatches.Patch(color=clone_colors[n], label=n) for n in sorted(clone_names)]
+        ncol = _adaptive_ncol(len(handles))
+        fig.legend(handles=handles, loc="lower center", fontsize=8, ncol=ncol,
+                   bbox_to_anchor=(0.5, -0.02))
+        fig.tight_layout(rect=[0, 0.06, 1, 1])
         save_figure(fig, os.path.join(output_dir, "04a_cumulative_feeds.png"))
 
-    # 04b: Temperature / pH KDE
-    available_controls = [c for c in ["temperature", "pH"] if c in df.columns]
-    if available_controls and CLONE_COL in df.columns:
+    # 04b: Process parameter KDE — all CONTROL_COLS, no clone grouping
+    available_controls = [c for c in CONTROL_COLS if c in df.columns]
+    if available_controls:
         n_ctrl = len(available_controls)
         fig, axes = plt.subplots(1, n_ctrl, figsize=(5 * n_ctrl, 4))
         if n_ctrl == 1:
             axes = [axes]
         for ax, ccol in zip(axes, available_controls):
-            plot_df = df[[CLONE_COL, ccol]].dropna()
-            sns.kdeplot(data=plot_df, x=ccol, hue=CLONE_COL, ax=ax,
-                        palette="tab10", fill=True, alpha=0.3)
+            col_data = df[ccol].dropna()
+            if len(col_data) > 0:
+                sns.kdeplot(data=col_data, ax=ax, fill=True, alpha=0.3, color="steelblue")
             ax.set_title(f"{ccol} Distribution")
+            ax.set_xlabel(ccol)
         fig.tight_layout()
         save_figure(fig, os.path.join(output_dir, "04b_process_params.png"))
 
@@ -396,9 +513,10 @@ def plot_feeding_strategy(df, kpi_df, output_dir):
             and CLONE_COL in kpi_df.columns):
         plot_df = kpi_df[["cum_feed_glc", "final_titer", CLONE_COL]].dropna()
         if len(plot_df) >= 3:
-            fig, ax = plt.subplots(figsize=(6, 5))
+            fig, ax = plt.subplots(figsize=(7, 5))
+            colors = _get_clone_colors(plot_df[CLONE_COL].unique())
             sns.scatterplot(data=plot_df, x="cum_feed_glc", y="final_titer",
-                            hue=CLONE_COL, palette="tab10", s=50, alpha=0.7, ax=ax)
+                            hue=CLONE_COL, palette=colors, s=50, alpha=0.7, ax=ax)
             # Linear regression line + R²
             x = plot_df["cum_feed_glc"].values
             y = plot_df["final_titer"].values
@@ -416,6 +534,9 @@ def plot_feeding_strategy(df, kpi_df, output_dir):
             ax.set_xlabel("Cumulative Glucose Feed")
             ax.set_ylabel("Final Titer (mg/L)")
             ax.set_title("Cumulative Feed vs Final Titer")
+            # Legend outside right
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+            fig.tight_layout()
             save_figure(fig, os.path.join(output_dir, "04c_feed_vs_titer.png"))
 
 
@@ -431,7 +552,7 @@ def plot_pca_clustering(df, n_clusters=5, n_timepoints=10, output_dir="eda_resul
         return
 
     unique_ids = df[EXP_ID_COL].unique()
-    clone_map = {}  # exp_id → clone_name
+    clone_map = {}  # exp_id -> clone_name
     unfolded = []
     valid_ids = []
 
@@ -475,10 +596,10 @@ def plot_pca_clustering(df, n_clusters=5, n_timepoints=10, output_dir="eda_resul
     actual_k = min(n_clusters, len(X_pca))
     labels = KMeans(n_clusters=actual_k, random_state=42, n_init=10).fit_predict(X_pca)
 
-    # Clone markers
+    # Clone markers — extended list with cycling
     clone_names = sorted(set(clone_map[uid] for uid in valid_ids))
-    markers = ["o", "s", "^", "D", "v", "P", "*", "X", "h", "p"]
-    clone_marker = {c: markers[i % len(markers)] for i, c in enumerate(clone_names)}
+    clone_marker = {c: MARKER_LIST[i % len(MARKER_LIST)] for i, c in enumerate(clone_names)}
+    clone_colors = _get_clone_colors(clone_names)
 
     fig, ax = plt.subplots(figsize=(8, 6))
     cmap = plt.get_cmap("Set2", actual_k)
@@ -489,20 +610,24 @@ def plot_pca_clustering(df, n_clusters=5, n_timepoints=10, output_dir="eda_resul
                    c=[cmap(labels[i])], marker=clone_marker[clone],
                    s=60, alpha=0.7, edgecolors="k", linewidths=0.3)
 
-    # Legends
+    # Cluster legend — upper left on axes
     cluster_handles = [mpatches.Patch(color=cmap(k), label=f"Cluster {k}")
                        for k in range(actual_k)]
-    clone_handles = [plt.Line2D([0], [0], marker=clone_marker[c], color="gray",
-                                linestyle="None", markersize=7, label=c)
-                     for c in clone_names]
     leg1 = ax.legend(handles=cluster_handles, loc="upper left", title="Cluster", fontsize=8)
     ax.add_artist(leg1)
-    ax.legend(handles=clone_handles, loc="upper right", title="Clone", fontsize=8)
+
+    # Clone legend — outside right
+    clone_handles = [plt.Line2D([0], [0], marker=clone_marker[c], color=clone_colors[c],
+                                linestyle="None", markersize=7, label=c)
+                     for c in clone_names]
+    ax.legend(handles=clone_handles, loc="upper left", bbox_to_anchor=(1.02, 1),
+              title="Clone", fontsize=8, ncol=1)
 
     ev = pca.explained_variance_ratio_
     ax.set_xlabel(f"PC1 ({ev[0]:.1%} variance)")
     ax.set_ylabel(f"PC2 ({ev[1]:.1%} variance)")
     ax.set_title(f"PCA + KMeans (k={actual_k}) on Batch-Unfolded States")
+    fig.tight_layout()
     save_figure(fig, os.path.join(output_dir, "05_pca_clustering.png"))
 
 
@@ -531,8 +656,10 @@ def main():
     kpi_df = compute_experiment_kpis(df)
 
     logger.info("=== Generating plots ===")
+    plot_clone_run_counts(df, args.output)
     plot_trajectory_overlays(df, args.output)
     plot_kpi_correlation(kpi_df, args.output)
+    plot_raw_correlation(df, args.output)
     plot_clone_comparison(kpi_df, args.output)
     plot_feeding_strategy(df, kpi_df, args.output)
     plot_pca_clustering(df, n_clusters=args.n_clusters, output_dir=args.output)
