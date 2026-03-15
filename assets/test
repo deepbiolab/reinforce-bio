@@ -271,7 +271,7 @@ def plot_clone_run_counts(df, output_dir):
 
 def plot_trajectory_overlays(df, output_dir):
     """2xN grid of state variable trajectories, colored by clone."""
-    available = [c for c in STATE_COLS if c in df.columns]
+    available = [c for c in STATE_COLS if c in df.columns and c != "titer"]
     if not available:
         logger.warning("No state columns found; skipping trajectory plot.")
         return
@@ -329,6 +329,9 @@ def plot_kpi_correlation(kpi_df, output_dir):
     sns.heatmap(corr, annot=True, fmt=".2f", cmap="RdBu_r", center=0,
                 vmin=-1, vmax=1, square=True, ax=ax, linewidths=0.5)
     ax.set_title("KPI Correlation Matrix")
+    fig.text(0.5, -0.02,
+             "Pearson correlation between per-run KPIs. Strong positive (red) or negative (blue) indicates linear association.",
+             ha="center", fontsize=9, style="italic", color="gray")
     save_figure(fig, os.path.join(output_dir, "02a_kpi_correlation_heatmap.png"))
 
 
@@ -401,6 +404,9 @@ def plot_clone_comparison(kpi_df, output_dir):
                     label.set_ha("right")
 
         fig.suptitle("Clone KPI Comparison", fontsize=13, y=1.02)
+        fig.text(0.5, -0.02,
+                 "Distribution of KPIs per clone. Box shows IQR; wider spread indicates higher clone variability.",
+                 ha="center", fontsize=9, style="italic", color="gray")
         fig.tight_layout()
         save_figure(fig, os.path.join(output_dir, "03a_clone_boxplots.png"))
 
@@ -489,7 +495,10 @@ def plot_feeding_strategy(df, kpi_df, output_dir):
         ncol = _adaptive_ncol(len(handles))
         fig.legend(handles=handles, loc="lower center", fontsize=8, ncol=ncol,
                    bbox_to_anchor=(0.5, -0.02))
-        fig.tight_layout(rect=[0, 0.06, 1, 1])
+        fig.text(0.5, -0.06,
+                 "Cumulative feed volume over time. Diverging trajectories indicate different feeding strategies across runs.",
+                 ha="center", fontsize=9, style="italic", color="gray")
+        fig.tight_layout(rect=[0, 0.10, 1, 1])
         save_figure(fig, os.path.join(output_dir, "04a_cumulative_feeds.png"))
 
     # 04b: Process parameter KDE — all CONTROL_COLS, no clone grouping
@@ -536,6 +545,9 @@ def plot_feeding_strategy(df, kpi_df, output_dir):
             ax.set_title("Cumulative Feed vs Final Titer")
             # Legend outside right
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+            fig.text(0.5, -0.02,
+                     "Each dot is one run. Trend line shows linear fit; R\u00b2 near 0 suggests feed amount alone does not predict titer.",
+                     ha="center", fontsize=9, style="italic", color="gray")
             fig.tight_layout()
             save_figure(fig, os.path.join(output_dir, "04c_feed_vs_titer.png"))
 
@@ -627,6 +639,9 @@ def plot_pca_clustering(df, n_clusters=5, n_timepoints=10, output_dir="eda_resul
     ax.set_xlabel(f"PC1 ({ev[0]:.1%} variance)")
     ax.set_ylabel(f"PC2 ({ev[1]:.1%} variance)")
     ax.set_title(f"PCA + KMeans (k={actual_k}) on Batch-Unfolded States")
+    fig.text(0.5, -0.02,
+             "Batch-unfolded state trajectories projected to 2D. Color = KMeans cluster, marker shape = clone identity.",
+             ha="center", fontsize=9, style="italic", color="gray")
     fig.tight_layout()
     save_figure(fig, os.path.join(output_dir, "05_pca_clustering.png"))
 
